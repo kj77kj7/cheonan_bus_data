@@ -2,15 +2,20 @@
 
 실시간 데이터는 소급 수집이 불가능하므로, 한 번 띄우면 죽지 않고 계속 도는 것이
 최우선이다. 개별 호출 실패는 기록만 하고 넘어가며, 어떤 예외도 루프를 멈추지
-않는다. 중간에 강제 종료되어도 다시 실행하면 그 시점부터 이어서 수집한다.
+않는다. 강제 종료되어도 다시 실행하면 그 시점부터 이어서 수집한다.
 
-수집 주기는 시간대별로 다르다. 정류장 간 거리 중앙값이 355m(표정속도 15km/h
-기준 약 85초)이므로, 첨두시간에는 60초 주기로 정류장을 거의 건너뛰지 않게 하고
-비첨두에는 600초로 낮춰 일일 호출 한도를 지킨다. 하루 2~3회만 운행하는 외곽
-노선은 조회 대부분이 빈 응답이라 별도로 분리해 900초 주기로 돌린다.
+두 가지 모드를 별도 프로세스로 동시에 돌린다. 하나가 죽어도 다른 하나는 살아남는다.
 
-실행:
-    python src/collect_realtime.py
+    python src/collect_realtime.py core      # 표본 22개 노선(37 routeId) / 60초
+    python src/collect_realtime.py network   # 전체 265개 routeId / 600초
+
+주기 설계 근거
+- 호출 1건당 응답이 약 4.5초로 느려서, 순차 호출로는 37개 한 바퀴에 196초가
+  걸린다. 60초 주기를 지키려면 병렬 호출이 필수다.
+- 인증키당 동시 접속에 제한이 있다. 실측상 동시 16개는 절반이 거부당했고,
+  8개에서 5%, 4~5개에서 0%였다. 두 모드를 합쳐 8개를 넘기지 않도록 잡았다.
+- 정류장 간 거리 중앙값이 355m(표정속도 15km/h 기준 약 85초)라, 핵심 노선의
+  60초 주기면 정류장을 거의 건너뛰지 않는다.
 """
 
 import csv
@@ -18,43 +23,48 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
 from config import BASE_LOCATION_INFO, CITY_CODE, DATA_DIR, LOGS_DIR, ENV_PATH, load_env
 
+# 윈도우 콘솔(cp949)이 못 찍는 문자 하나로 수집이 멈추는 일이 없어야 한다.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 OPERATION = "getRouteAcctoBusLcList"
+ROUTES_CSV = os.path.join(DATA_DIR, "routes_34010.csv")
 DETAIL_CSV = os.path.join(DATA_DIR, "cheonan_routes_detail.csv")
 REALTIME_DIR = os.path.join(DATA_DIR, "realtime")
 
-# --- 수집 대상 ---
-CORE_ROUTENOS = [
-    "5", "405", "80", "85", "88",                        # 처치군
-    "6", "400", "11", "2", "3", "121", "90", "800", "7",  # 도심 간선
-    "900", "910", "140",                                  # 중간층
+# 표본 22개 노선. 상·하행이 별도 routeId 라 실제로는 37개가 된다.
+SAMPLE_ROUTENOS = [
+    "5", "405", "80", "85", "88",                          # 처치군
+    "6", "400", "11", "2", "3", "121", "90", "800", "7",   # 도심 간선
+    "900", "910", "140",                                   # 중간층
+    "402", "414", "82", "221", "601",                      # 외곽
 ]
-OUTER_ROUTENOS = ["402", "414", "82", "221", "601"]       # 하루 2~3회 운행
 
-# --- 시간대별 주기(초) ---
-# (시작, 끝, 주기). 끝 시각은 포함하지 않는다.
-CORE_BANDS = [
-    ("05:30", "07:00", 600),
-    ("07:00", "09:00", 60),    # 오전 첨두
-    ("09:00", "17:00", 600),
-    ("17:00", "19:00", 60),    # 오후 첨두
-    ("19:00", "23:00", 600),
-]
-OUTER_BAND = ("06:00", "20:00", 900)
+MODES = {
+    "core": {
+        "label": "핵심",
+        "interval": 60,
+        "workers": 5,
+        "budget": 120000,   # 실제 소요는 약 38,850건
+    },
+    "network": {
+        "label": "전체",
+        "interval": 600,
+        "workers": 3,
+        "budget": 150000,   # 실제 소요는 약 27,825건
+    },
+}
 
 DAY_START, DAY_END = "05:30", "23:00"
-
-# --- 호출 한도 ---
-DAILY_QUOTA = 10000
-QUOTA_RESERVE = 300        # 재시도용으로 남겨두는 몫
-CALL_GAP_SEC = 0.15        # 한 순회 안에서 호출 간 간격
 REQUEST_TIMEOUT = 15
-MAX_ATTEMPTS = 2           # 실시간은 다음 순회가 곧 오므로 재시도를 얕게 한다
+MAX_ATTEMPTS = 2          # 다음 순회가 곧 오므로 재시도를 얕게 한다
 
 CSV_COLUMNS = [
     "ts", "routeid", "routeno", "vehicleno",
@@ -67,76 +77,76 @@ def hhmm(text):
     return int(h) * 60 + int(m)
 
 
-def now_minutes(dt):
-    return dt.hour * 60 + dt.minute
-
-
 def load_service_key():
     env = load_env(ENV_PATH)
     for name in ("SERVICE_KEY_DECODING", "SERVICE_KEY_ENCODING"):
         value = env.get(name, "").strip()
         if value and not value.startswith("여기에"):
             return value
-    print("[중단] .env 에 인증키가 없습니다: " + ENV_PATH)
-    sys.exit(1)
+    sys.exit("[중단] .env 에 인증키가 없습니다: " + ENV_PATH)
 
 
-def load_route_ids():
-    """노선번호 -> routeid 목록. 상·하행이 분리돼 있어 양방향을 모두 받는다."""
+def load_targets(mode):
+    """(routeno, routeid) 목록. core 는 표본만, network 는 전체."""
     if not os.path.exists(DETAIL_CSV):
-        print("[중단] %s 가 없습니다. 단계 1 을 먼저 실행하십시오." % DETAIL_CSV)
-        sys.exit(1)
+        sys.exit("[중단] %s 가 없습니다. 단계 1 을 먼저 실행하십시오." % DETAIL_CSV)
 
-    by_no = {}
+    rows = []
     with open(DETAIL_CSV, encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
-            by_no.setdefault(row["routeno"], []).append(row["routeid"])
+            rows.append((row["routeno"], row["routeid"]))
 
-    def collect(routenos, label):
-        pairs = []
-        for no in routenos:
-            ids = by_no.get(no)
-            if not ids:
-                print("[경고] %s 노선 %s번을 노선목록에서 찾지 못했습니다." % (label, no))
-                continue
-            for rid in ids:
-                pairs.append((no, rid))
-        return pairs
+    if mode == "network":
+        # 상세 조회에서 누락된 노선이 있을 수 있어 원본 목록으로 보강한다
+        known = {rid for _, rid in rows}
+        if os.path.exists(ROUTES_CSV):
+            with open(ROUTES_CSV, encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    if row["routeid"] not in known:
+                        rows.append((row.get("routeno", ""), row["routeid"]))
+        return rows
 
-    return collect(CORE_ROUTENOS, "핵심"), collect(OUTER_ROUTENOS, "외곽")
+    wanted = set(SAMPLE_ROUTENOS)
+    targets = [(no, rid) for no, rid in rows if no in wanted]
+    missing = wanted - {no for no, _ in targets}
+    if missing:
+        print("[경고] 노선목록에서 찾지 못한 노선번호: %s" % ", ".join(sorted(missing)))
+    return targets
 
 
 class Quota:
     """날짜별 호출량을 파일에 남겨, 재시작해도 그날 쓴 양을 잃지 않게 한다."""
 
-    def __init__(self):
+    def __init__(self, mode, budget):
+        self.mode = mode
+        self.budget = budget
         self.date = None
         self.count = 0
         self._load(datetime.now())
 
     def _path(self, day):
-        return os.path.join(LOGS_DIR, "quota_%s.json" % day)
+        return os.path.join(LOGS_DIR, "quota_%s_%s.json" % (self.mode, day))
 
     def _load(self, dt):
-        day = dt.strftime("%Y%m%d")
-        self.date = day
-        path = self._path(day)
+        self.date = dt.strftime("%Y%m%d")
+        path = self._path(self.date)
+        self.count = 0
         if os.path.exists(path):
             try:
                 with open(path, encoding="utf-8") as f:
                     self.count = int(json.load(f).get("count", 0))
-                return
-            except (ValueError, OSError):
+            except (ValueError, OSError, KeyError):
                 pass  # 파일이 깨졌으면 0 부터 다시 센다
-        self.count = 0
 
     def _save(self):
-        os.makedirs(LOGS_DIR, exist_ok=True)
-        with open(self._path(self.date), "w", encoding="utf-8") as f:
-            json.dump({"date": self.date, "count": self.count}, f)
+        try:
+            os.makedirs(LOGS_DIR, exist_ok=True)
+            with open(self._path(self.date), "w", encoding="utf-8") as f:
+                json.dump({"date": self.date, "mode": self.mode, "count": self.count}, f)
+        except OSError:
+            pass  # 기록 실패가 수집을 멈추게 해선 안 된다
 
     def roll(self, dt):
-        """날짜가 바뀌면 카운터를 새로 시작한다."""
         day = dt.strftime("%Y%m%d")
         if day != self.date:
             self._load(dt)
@@ -144,7 +154,7 @@ class Quota:
         return False
 
     def remaining(self):
-        return DAILY_QUOTA - QUOTA_RESERVE - self.count
+        return self.budget - self.count
 
     def spend(self, n):
         self.count += n
@@ -152,7 +162,11 @@ class Quota:
 
 
 def fetch_route(service_key, route_id):
-    """한 노선의 운행 중 차량 목록. (rows, 호출횟수) 를 반환한다."""
+    """한 노선의 운행 중 차량 목록.
+
+    (rows, 호출횟수, 응답시각) 을 반환한다. 한 순회가 수십 초에 걸치므로
+    순회 시작시각이 아니라 호출별 응답시각을 기록해야 위치가 정확해진다.
+    """
     params = {
         "serviceKey": service_key,
         "_type": "json",
@@ -170,6 +184,7 @@ def fetch_route(service_key, route_id):
         try:
             with urlopen(url, timeout=REQUEST_TIMEOUT) as resp:
                 raw = resp.read().decode("utf-8")
+            ts = datetime.now()
             data = json.loads(raw)
             response = data.get("response", {})
             header = response.get("header", {})
@@ -178,29 +193,30 @@ def fetch_route(service_key, route_id):
                                    % (header.get("resultCode"), header.get("resultMsg")))
             items = response.get("body", {}).get("items", "")
             if items in ("", None):
-                return [], calls  # 운행 중인 차량이 없는 정상 상태
+                return [], calls, ts       # 운행 중인 차량이 없는 정상 상태
             item = items.get("item", [])
             if isinstance(item, dict):
                 item = [item]
-            return item, calls
-        except (OSError, RuntimeError, ValueError) as e:
+            return item, calls, ts
+        except Exception as e:
             last_err = e
             if attempt + 1 < MAX_ATTEMPTS:
                 time.sleep(0.4)
-    raise RuntimeError(str(last_err))
+    return None, calls, last_err
 
 
 class Writer:
     """날짜별 CSV. 자정을 넘기면 새 파일로 넘어간다."""
 
-    def __init__(self):
+    def __init__(self, mode):
+        self.mode = mode
         self.day = None
         self.fh = None
         self.writer = None
 
     def _open(self, day):
         os.makedirs(REALTIME_DIR, exist_ok=True)
-        path = os.path.join(REALTIME_DIR, "buslc_%s.csv" % day)
+        path = os.path.join(REALTIME_DIR, "%s_%s.csv" % (self.mode, day))
         is_new = not os.path.exists(path)
         self.fh = open(path, "a", encoding="utf-8-sig", newline="")
         self.writer = csv.DictWriter(self.fh, fieldnames=CSV_COLUMNS, extrasaction="ignore")
@@ -209,16 +225,15 @@ class Writer:
         self.day = day
         return path
 
-    def write(self, dt, routeno, route_id, rows):
-        day = dt.strftime("%Y%m%d")
+    def write(self, ts, routeno, route_id, rows):
+        day = ts.strftime("%Y%m%d")
         if day != self.day:
             self.close()
-            path = self._open(day)
-            log("수집 파일: %s" % path)
-        ts = dt.isoformat(timespec="seconds")
+            log(self.mode, "수집 파일: %s" % self._open(day))
+        stamp = ts.isoformat(timespec="seconds")
         for r in rows:
             self.writer.writerow({
-                "ts": ts,
+                "ts": stamp,
                 "routeid": route_id,
                 "routeno": routeno,
                 "vehicleno": r.get("vehicleno", ""),
@@ -241,129 +256,126 @@ class Writer:
             self.writer = None
 
 
-def log(msg):
-    line = "[%s] %s" % (datetime.now().strftime("%m-%d %H:%M:%S"), msg)
-    print(line, flush=True)
+def log(mode, msg):
+    line = "[%s][%s] %s" % (datetime.now().strftime("%m-%d %H:%M:%S"), mode, msg)
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass  # 콘솔 출력 실패가 수집을 멈추게 해선 안 된다
     try:
         os.makedirs(LOGS_DIR, exist_ok=True)
-        path = os.path.join(LOGS_DIR, "collect_%s.log" % datetime.now().strftime("%Y%m%d"))
+        path = os.path.join(LOGS_DIR, "collect_%s_%s.log"
+                            % (mode, datetime.now().strftime("%Y%m%d")))
         with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:
-        pass  # 로그 기록 실패가 수집을 멈추게 해선 안 된다
+        pass
 
 
-def core_interval(dt):
-    """현재 시각에 해당하는 핵심 노선 주기(초). 수집 시간대 밖이면 None."""
-    m = now_minutes(dt)
-    for start, end, interval in CORE_BANDS:
-        if hhmm(start) <= m < hhmm(end):
-            return interval
-    return None
-
-
-def in_outer_band(dt):
-    m = now_minutes(dt)
-    return hhmm(OUTER_BAND[0]) <= m < hhmm(OUTER_BAND[1])
-
-
-def sweep(service_key, pairs, writer, quota, label):
-    """대상 노선을 한 바퀴 돌며 수집한다."""
-    if quota.remaining() <= len(pairs):
-        log("[한도] 잔여 %d건 — %s 순회를 건너뜁니다." % (quota.remaining(), label))
-        return
-
-    started = time.time()
-    vehicles = 0
-    failed = 0
-    calls = 0
-
-    for routeno, route_id in pairs:
-        try:
-            rows, used = fetch_route(service_key, route_id)
-            calls += used
-            writer.write(datetime.now(), routeno, route_id, rows)
-            vehicles += len(rows)
-        except RuntimeError as e:
-            calls += MAX_ATTEMPTS
-            failed += 1
-            log("  실패 %s(%s): %s" % (routeno, route_id, e))
-        except Exception as e:  # 예상 못한 예외로도 루프를 멈추지 않는다
-            calls += 1
-            failed += 1
-            log("  예외 %s(%s): %r" % (routeno, route_id, e))
-        time.sleep(CALL_GAP_SEC)
-
-    writer.flush()
-    quota.spend(calls)
-    log("%s 순회 완료 | 차량 %d대 | 호출 %d건 | 실패 %d건 | %.1f초 | 오늘 누적 %d/%d"
-        % (label, vehicles, calls, failed, time.time() - started, quota.count, DAILY_QUOTA))
+def in_day_window(dt):
+    m = dt.hour * 60 + dt.minute
+    return hhmm(DAY_START) <= m < hhmm(DAY_END)
 
 
 def seconds_until_day_start(dt):
-    """다음 수집 시작 시각까지 남은 초."""
     start_m = hhmm(DAY_START)
-    m = now_minutes(dt)
     target = dt.replace(hour=start_m // 60, minute=start_m % 60, second=0, microsecond=0)
-    if m >= start_m:
+    if (dt.hour * 60 + dt.minute) >= start_m:
         target += timedelta(days=1)
     return max(1, int((target - dt).total_seconds()))
 
 
+def sweep(service_key, targets, writer, quota, mode, workers):
+    """대상 노선을 병렬로 한 바퀴 돌며 수집한다."""
+    if quota.remaining() < len(targets) * MAX_ATTEMPTS:
+        log(mode, "[한도] 잔여 %d건 — 오늘 수집을 중단합니다." % quota.remaining())
+        return False
+
+    started = time.time()
+    # CSV 쓰기는 메인 스레드에서만 한다 (스레드 안전성 확보)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(lambda t: (t, fetch_route(service_key, t[1])), targets))
+
+    vehicles = failed = calls = 0
+    for (routeno, route_id), (rows, used, ts_or_err) in results:
+        calls += used
+        if rows is None:
+            failed += 1
+            if failed <= 3:  # 로그가 넘치지 않게 앞의 몇 건만 남긴다
+                log(mode, "  실패 %s(%s): %s" % (routeno, route_id, ts_or_err))
+            continue
+        try:
+            writer.write(ts_or_err, routeno, route_id, rows)
+            vehicles += len(rows)
+        except Exception as e:
+            log(mode, "  쓰기 실패 %s: %r" % (route_id, e))
+
+    writer.flush()
+    quota.spend(calls)
+    elapsed = time.time() - started
+    log(mode, "순회 완료 | 차량 %d대 | 호출 %d건 | 실패 %d건 | %.1f초 | 오늘 %d/%d건"
+        % (vehicles, calls, failed, elapsed, quota.count, quota.budget))
+    return elapsed
+
+
 def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "core"
+    if mode not in MODES:
+        sys.exit("사용법: python collect_realtime.py [core|network]")
+
+    cfg = MODES[mode]
     service_key = load_service_key()
-    core_pairs, outer_pairs = load_route_ids()
+    targets = load_targets(mode)
 
-    log("=" * 60)
-    log("단계 3 실시간 수집 시작")
-    log("핵심 %d개 routeId / 외곽 %d개 routeId (합계 %d개)"
-        % (len(core_pairs), len(outer_pairs), len(core_pairs) + len(outer_pairs)))
-    log("수집 시간대 %s~%s | 첨두 60초 / 비첨두 600초 / 외곽 900초"
-        % (DAY_START, DAY_END))
-    log("일일 한도 %d건 (재시도 예비 %d건 제외하고 사용)" % (DAILY_QUOTA, QUOTA_RESERVE))
-    log("중지하려면 Ctrl+C. 다시 실행하면 그 시점부터 이어서 수집합니다.")
-    log("=" * 60)
+    log(mode, "=" * 58)
+    log(mode, "단계 3 실시간 수집 시작 — %s 모드" % cfg["label"])
+    log(mode, "대상 %d개 routeId | 주기 %d초 | 동시 요청 %d개"
+        % (len(targets), cfg["interval"], cfg["workers"]))
+    log(mode, "수집 시간대 %s~%s | 일일 예산 %s건" % (DAY_START, DAY_END, format(cfg["budget"], ",")))
+    log(mode, "중지: Ctrl+C. 다시 실행하면 그 시점부터 이어서 수집합니다.")
+    log(mode, "=" * 58)
 
-    quota = Quota()
+    quota = Quota(mode, cfg["budget"])
     if quota.count:
-        log("오늘 이미 %d건 사용한 기록이 있습니다. 이어서 셉니다." % quota.count)
+        log(mode, "오늘 이미 %d건 사용한 기록이 있습니다. 이어서 셉니다." % quota.count)
 
-    writer = Writer()
-    next_core = datetime.now()
-    next_outer = datetime.now()
+    writer = Writer(mode)
+    next_at = datetime.now()
 
     try:
         while True:
             now = datetime.now()
-
             if quota.roll(now):
-                log("날짜가 바뀌었습니다. 호출량 카운터를 새로 시작합니다.")
+                log(mode, "날짜가 바뀌었습니다. 호출량 카운터를 새로 시작합니다.")
 
-            interval = core_interval(now)
-            if interval is None:
+            if not in_day_window(now):
                 writer.close()
                 wait = seconds_until_day_start(now)
-                log("수집 시간대 밖입니다. %s 까지 %d분 대기합니다." % (DAY_START, wait // 60))
+                log(mode, "수집 시간대 밖입니다. %s 까지 %d분 대기합니다." % (DAY_START, wait // 60))
                 time.sleep(wait)
-                next_core = datetime.now()
-                next_outer = datetime.now()
+                next_at = datetime.now()
                 continue
 
-            if now >= next_core:
-                sweep(service_key, core_pairs, writer, quota, "핵심(%d초)" % interval)
-                next_core = datetime.now() + timedelta(seconds=interval)
+            if now >= next_at:
+                elapsed = sweep(service_key, targets, writer, quota, mode, cfg["workers"])
+                if elapsed is False:
+                    # 예산 소진. 다음 날까지 쉰다
+                    writer.close()
+                    time.sleep(seconds_until_day_start(datetime.now()))
+                    next_at = datetime.now()
+                    continue
+                if elapsed > cfg["interval"]:
+                    log(mode, "[주의] 순회에 %.0f초가 걸려 주기 %d초를 넘겼습니다. "
+                              "실제 해상도가 낮아집니다." % (elapsed, cfg["interval"]))
+                    next_at = datetime.now()
+                else:
+                    next_at = now + timedelta(seconds=cfg["interval"])
 
-            now = datetime.now()
-            if in_outer_band(now) and now >= next_outer:
-                sweep(service_key, outer_pairs, writer, quota, "외곽(%d초)" % OUTER_BAND[2])
-                next_outer = datetime.now() + timedelta(seconds=OUTER_BAND[2])
-
-            # 다음 할 일까지 짧게 나눠 자야 Ctrl+C 가 바로 먹는다
-            wake = min(next_core, next_outer if in_outer_band(datetime.now()) else next_core)
-            time.sleep(max(1, min(5, (wake - datetime.now()).total_seconds())))
+            # 짧게 나눠 자야 Ctrl+C 가 바로 먹는다
+            time.sleep(max(1, min(5, (next_at - datetime.now()).total_seconds())))
 
     except KeyboardInterrupt:
-        log("사용자 중지. 오늘 누적 호출 %d건." % quota.count)
+        log(mode, "사용자 중지. 오늘 누적 호출 %d건." % quota.count)
     finally:
         writer.close()
 
