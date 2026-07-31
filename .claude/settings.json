@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Get-Content *)",
+      "PowerShell(Get-ScheduledTask *)",
+      "PowerShell(Get-ScheduledTaskInfo *)",
+      "PowerShell(Get-CimInstance Win32_Process *)",
+      "PowerShell(python src\\check_health.py)",
+      "PowerShell(python src\\check_health.py *)",
+      "PowerShell(schtasks /query *)"
+    ]
+  }
+}

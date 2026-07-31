@@ -10,3 +10,9 @@ logs/
 # 파이썬
 __pycache__/
 *.py[cod]
+
+# 등록 스크립트가 생성하는 런처 (파이썬 경로가 PC 마다 다르다)
+scripts/run_collector.cmd
+
+# 개인 설정
+.claude/settings.local.json
