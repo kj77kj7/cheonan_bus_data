@@ -52,17 +52,21 @@ MODES = {
         "label": "핵심",
         "interval": 60,
         "workers": 5,
-        "budget": 120000,   # 실제 소요는 약 38,850건
+        "budget": 120000,   # 실제 소요는 약 43,290건
     },
     "network": {
         "label": "전체",
         "interval": 600,
         "workers": 3,
-        "budget": 150000,   # 실제 소요는 약 27,825건
+        "budget": 150000,   # 실제 소요는 약 31,005건
     },
 }
 
-DAY_START, DAY_END = "05:30", "23:00"
+# 수집 시간대. 자정을 넘겨도 된다 (05:30 시작, 다음날 01:00 종료).
+# 23:00 에 끊으면 그때 출발하는 막차(7·90번)와 심야 순환노선(10번, 22:00~03:00)을
+# 놓친다. 심야는 혼잡이 없어 구간 소요시간이 곧 자유흐름 기준선이 되므로,
+# 지연(= 실제 소요시간 - 자유흐름)을 정의하는 데 오히려 중요한 시간대다.
+DAY_START, DAY_END = "05:30", "01:00"
 REQUEST_TIMEOUT = 15
 MAX_ATTEMPTS = 2          # 다음 순회가 곧 오므로 재시도를 얕게 한다
 
@@ -273,8 +277,12 @@ def log(mode, msg):
 
 
 def in_day_window(dt):
+    """수집 시간대 안인지. 시작 > 종료면 자정을 넘는 구간으로 해석한다."""
     m = dt.hour * 60 + dt.minute
-    return hhmm(DAY_START) <= m < hhmm(DAY_END)
+    start, end = hhmm(DAY_START), hhmm(DAY_END)
+    if start < end:
+        return start <= m < end
+    return m >= start or m < end
 
 
 def seconds_until_day_start(dt):
