@@ -69,6 +69,7 @@ MODES = {
 DAY_START, DAY_END = "05:30", "01:00"
 REQUEST_TIMEOUT = 15
 MAX_ATTEMPTS = 2          # 다음 순회가 곧 오므로 재시도를 얕게 한다
+ALERT_AFTER = 3           # 전 노선 실패가 이만큼 이어지면 경보를 띄운다
 
 CSV_COLUMNS = [
     "ts", "routeid", "routeno", "vehicleno",
@@ -293,11 +294,28 @@ def seconds_until_day_start(dt):
     return max(1, int((target - dt).total_seconds()))
 
 
+# 인증키 문제로 보이는 응답. 이런 오류는 기다린다고 저절로 낫지 않으므로
+# 일시적 네트워크 장애와 구분해 알려야 한다.
+AUTH_ERROR_HINTS = (
+    "SERVICE_KEY", "SERVICE KEY", "LIMITED_NUMBER_OF_SERVICE_REQUESTS",
+    "resultCode=30", "resultCode=31", "resultCode=32",
+    "resultCode=20", "resultCode=22",
+)
+
+
+def looks_like_auth_error(text):
+    upper = str(text).upper()
+    return any(h in upper for h in AUTH_ERROR_HINTS)
+
+
 def sweep(service_key, targets, writer, quota, mode, workers):
-    """대상 노선을 병렬로 한 바퀴 돌며 수집한다."""
+    """대상 노선을 병렬로 한 바퀴 돌며 수집한다.
+
+    (소요초, 실패수, 대상수, 대표오류) 를 반환한다. 예산이 소진되면 None.
+    """
     if quota.remaining() < len(targets) * MAX_ATTEMPTS:
         log(mode, "[한도] 잔여 %d건 — 오늘 수집을 중단합니다." % quota.remaining())
-        return False
+        return None
 
     started = time.time()
     # CSV 쓰기는 메인 스레드에서만 한다 (스레드 안전성 확보)
@@ -305,10 +323,13 @@ def sweep(service_key, targets, writer, quota, mode, workers):
         results = list(ex.map(lambda t: (t, fetch_route(service_key, t[1])), targets))
 
     vehicles = failed = calls = 0
+    first_err = None
     for (routeno, route_id), (rows, used, ts_or_err) in results:
         calls += used
         if rows is None:
             failed += 1
+            if first_err is None:
+                first_err = ts_or_err
             if failed <= 3:  # 로그가 넘치지 않게 앞의 몇 건만 남긴다
                 log(mode, "  실패 %s(%s): %s" % (routeno, route_id, ts_or_err))
             continue
@@ -323,7 +344,58 @@ def sweep(service_key, targets, writer, quota, mode, workers):
     elapsed = time.time() - started
     log(mode, "순회 완료 | 차량 %d대 | 호출 %d건 | 실패 %d건 | %.1f초 | 오늘 %d/%d건"
         % (vehicles, calls, failed, elapsed, quota.count, quota.budget))
-    return elapsed
+    return elapsed, failed, len(targets), first_err
+
+
+def alert_path(mode):
+    return os.path.join(LOGS_DIR, "ALERT_%s.txt" % mode)
+
+
+def raise_alert(mode, streak, err):
+    """전멸이 이어지면 눈에 띄게 남긴다. 로그만 보면 놓치기 쉽다."""
+    auth = looks_like_auth_error(err)
+    lines = [
+        "수집 중단 상태입니다.",
+        "발생 시각: %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "모드: %s" % mode,
+        "연속 전멸 순회: %d회" % streak,
+        "대표 오류: %s" % err,
+        "",
+    ]
+    if auth:
+        lines += [
+            "인증키 문제로 보입니다. 다음을 확인하십시오.",
+            "  1. data.go.kr 마이페이지 > 활용신청 현황 — 활용기간이 만료되지 않았는지",
+            "  2. 일일 트래픽 초과 여부 (한도 500,000건)",
+            "  3. .env 의 키가 그대로인지",
+            "키를 갱신했으면 .env 를 고치고 수집기를 다시 실행하면 됩니다.",
+        ]
+    else:
+        lines += [
+            "네트워크 또는 서버 장애로 보입니다.",
+            "  1. 인터넷 연결 확인",
+            "  2. data.go.kr 공지사항에서 점검 일정 확인",
+            "복구되면 수집기가 알아서 다시 수집합니다. 껐다 켤 필요 없습니다.",
+        ]
+
+    log(mode, "!" * 58)
+    for line in lines:
+        log(mode, line)
+    log(mode, "!" * 58)
+    try:
+        with open(alert_path(mode), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
+def clear_alert(mode):
+    try:
+        if os.path.exists(alert_path(mode)):
+            os.remove(alert_path(mode))
+            log(mode, "수집이 정상으로 돌아왔습니다. 경보를 해제합니다.")
+    except OSError:
+        pass
 
 
 def main():
@@ -349,6 +421,7 @@ def main():
 
     writer = Writer(mode)
     next_at = datetime.now()
+    fail_streak = 0   # 전 노선이 실패한 순회가 몇 번 이어졌는지
 
     try:
         while True:
@@ -365,13 +438,26 @@ def main():
                 continue
 
             if now >= next_at:
-                elapsed = sweep(service_key, targets, writer, quota, mode, cfg["workers"])
-                if elapsed is False:
+                result = sweep(service_key, targets, writer, quota, mode, cfg["workers"])
+                if result is None:
                     # 예산 소진. 다음 날까지 쉰다
                     writer.close()
                     time.sleep(seconds_until_day_start(datetime.now()))
                     next_at = datetime.now()
                     continue
+
+                elapsed, failed, total, first_err = result
+                if failed == total:
+                    fail_streak += 1
+                    if fail_streak == ALERT_AFTER:
+                        raise_alert(mode, fail_streak, first_err)
+                    elif fail_streak > ALERT_AFTER and fail_streak % 30 == 0:
+                        log(mode, "[경고] 전멸이 %d회째 이어지고 있습니다." % fail_streak)
+                else:
+                    if fail_streak >= ALERT_AFTER:
+                        clear_alert(mode)
+                    fail_streak = 0
+
                 if elapsed > cfg["interval"]:
                     log(mode, "[주의] 순회에 %.0f초가 걸려 주기 %d초를 넘겼습니다. "
                               "실제 해상도가 낮아집니다." % (elapsed, cfg["interval"]))
