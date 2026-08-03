@@ -10,18 +10,18 @@
     python src/collect_realtime.py network   # 전체 265개 routeId / 600초
 
 주기 설계 근거
-- 호출 1건당 응답이 약 4.5초로 느려서, 순차 호출로는 37개 한 바퀴에 196초가
-  걸린다. 60초 주기를 지키려면 병렬 호출이 필수다.
-- 인증키당 동시 접속에 제한이 있다. 실측상 동시 16개는 절반이 거부당했고,
-  8개에서 5%, 4~5개에서 0%였다. 두 모드를 합쳐 8개를 넘기지 않도록 잡았다.
 - 정류장 간 거리 중앙값이 355m(표정속도 15km/h 기준 약 85초)라, 핵심 노선의
   60초 주기면 정류장을 거의 건너뛰지 않는다.
+- 인증키당 초당 요청 수에 제한이 있어 넘기면 429 가 돌아온다. 동시 요청 수만
+  조여서는 응답이 빠를 때 순간 속도를 못 막으므로, 요청 시작 간격(min_gap)을
+  강제해 주기 전체에 고르게 편다. 자세한 근거는 아래 '속도 설계 근거' 참고.
 """
 
 import csv
 import json
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -47,17 +47,20 @@ SAMPLE_ROUTENOS = [
     "402", "414", "82", "221", "601",                      # 외곽
 ]
 
+# min_gap: 요청 시작 사이의 최소 간격(초). 아래 '속도 설계 근거' 참고.
 MODES = {
     "core": {
         "label": "핵심",
         "interval": 60,
-        "workers": 5,
+        "workers": 3,
+        "min_gap": 1.2,     # 37건 × 1.2초 = 44초 (주기 60초 안)
         "budget": 120000,   # 실제 소요는 약 43,290건
     },
     "network": {
         "label": "전체",
         "interval": 600,
-        "workers": 3,
+        "workers": 2,
+        "min_gap": 1.8,     # 265건 × 1.8초 = 477초 (주기 600초 안)
         "budget": 150000,   # 실제 소요는 약 31,005건
     },
 }
@@ -70,6 +73,19 @@ DAY_START, DAY_END = "05:30", "01:00"
 REQUEST_TIMEOUT = 15
 MAX_ATTEMPTS = 2          # 다음 순회가 곧 오므로 재시도를 얕게 한다
 ALERT_AFTER = 3           # 전 노선 실패가 이만큼 이어지면 경보를 띄운다
+RATE_LIMIT_BACKOFF = 5.0  # 429 를 만나면 이만큼 쉬었다 재시도한다
+
+# 속도 설계 근거
+#
+# https 전환 전에는 응답이 4.5초씩 걸려서, 동시 요청 수만 조여도 초당 요청 수가
+# 자연히 억제됐다. https 는 0.1~2초라 같은 워커 수로도 순간 속도가 9건/초까지
+# 튀고, 그러면 인증키 단위로 429(Too Many Requests) 가 걸린다. 실측에서는
+# 수집기가 도는 동안 별도 프로세스의 0.5건/초 요청조차 전부 429 였다.
+#
+# 정작 필요한 속도는 낮다. core 는 37건/60초 = 0.62건/초, network 는
+# 265건/600초 = 0.44건/초면 된다. 한 번에 몰아 쏘고 노는 대신 주기 전체에
+# 고르게 펴면 순간 속도가 낮아져 429 를 피할 수 있다. min_gap 이 그 간격이다.
+# 한 순회가 주기를 넘지 않도록 (대상수 × min_gap) < interval 을 지켜야 한다.
 
 CSV_COLUMNS = [
     "ts", "routeid", "routeno", "vehicleno",
@@ -166,7 +182,40 @@ class Quota:
         self._save()
 
 
-def fetch_route(service_key, route_id):
+class Pacer:
+    """요청 시작 사이에 최소 간격을 강제한다.
+
+    워커 수만 조여서는 응답이 빠를 때 순간 속도를 못 막는다. 여러 스레드가
+    공유하며, 각자 자기 차례를 배정받아 그때까지 기다린다.
+    """
+
+    def __init__(self, min_gap):
+        self.min_gap = min_gap
+        self._lock = threading.Lock()
+        self._next_at = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            due = self._next_at if self._next_at > now else now
+            self._next_at = due + self.min_gap
+        delay = due - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+    def pause(self, seconds):
+        """429 등을 만났을 때 전체 요청을 잠시 미룬다 (한 스레드만 쉬어선 소용없다)."""
+        with self._lock:
+            target = time.monotonic() + seconds
+            if target > self._next_at:
+                self._next_at = target
+
+
+def is_rate_limited(err):
+    return "429" in str(err) or "Too Many Requests" in str(err)
+
+
+def fetch_route(service_key, route_id, pacer=None):
     """한 노선의 운행 중 차량 목록.
 
     (rows, 호출횟수, 응답시각) 을 반환한다. 한 순회가 수십 초에 걸치므로
@@ -186,6 +235,8 @@ def fetch_route(service_key, route_id):
     last_err = None
     for attempt in range(MAX_ATTEMPTS):
         calls += 1
+        if pacer:
+            pacer.wait()
         try:
             with urlopen(url, timeout=REQUEST_TIMEOUT) as resp:
                 raw = resp.read().decode("utf-8")
@@ -205,7 +256,11 @@ def fetch_route(service_key, route_id):
             return item, calls, ts
         except Exception as e:
             last_err = e
-            if attempt + 1 < MAX_ATTEMPTS:
+            # 429 는 '조금 있다 다시' 라는 뜻이라, 나 혼자 쉬어선 소용이 없다.
+            # 전체 요청을 미뤄야 키 단위 한도가 풀린다.
+            if pacer and is_rate_limited(e):
+                pacer.pause(RATE_LIMIT_BACKOFF)
+            elif attempt + 1 < MAX_ATTEMPTS:
                 time.sleep(0.4)
     return None, calls, last_err
 
@@ -313,7 +368,7 @@ def looks_like_auth_error(text):
     return any(h in upper for h in AUTH_ERROR_HINTS)
 
 
-def sweep(service_key, targets, writer, quota, mode, workers):
+def sweep(service_key, targets, writer, quota, mode, workers, pacer):
     """대상 노선을 병렬로 한 바퀴 돌며 수집한다.
 
     (소요초, 실패수, 대상수, 대표오류, 쓰기실패수, 쓰기오류) 를 반환한다.
@@ -326,15 +381,17 @@ def sweep(service_key, targets, writer, quota, mode, workers):
     started = time.time()
     # CSV 쓰기는 메인 스레드에서만 한다 (스레드 안전성 확보)
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        results = list(ex.map(lambda t: (t, fetch_route(service_key, t[1])), targets))
+        results = list(ex.map(lambda t: (t, fetch_route(service_key, t[1], pacer)), targets))
 
-    vehicles = failed = calls = wrote_failed = 0
+    vehicles = failed = calls = wrote_failed = throttled = 0
     first_err = None
     write_err = None
     for (routeno, route_id), (rows, used, ts_or_err) in results:
         calls += used
         if rows is None:
             failed += 1
+            if is_rate_limited(ts_or_err):
+                throttled += 1
             if first_err is None:
                 first_err = ts_or_err
             if failed <= 3:  # 로그가 넘치지 않게 앞의 몇 건만 남긴다
@@ -355,6 +412,9 @@ def sweep(service_key, targets, writer, quota, mode, workers):
     elapsed = time.time() - started
     line = ("순회 완료 | 차량 %d대 | 호출 %d건 | 실패 %d건 | %.1f초 | 오늘 %d/%d건"
             % (vehicles, calls, failed, elapsed, quota.count, quota.budget))
+    if throttled:
+        # 속도 조절이 부족하다는 신호. min_gap 을 늘려야 하는지 판단하는 근거가 된다
+        line += " | 429 %d건" % throttled
     if wrote_failed:
         # 호출은 성공했는데 저장에 실패한 건수. 위 '실패' 와 성격이 다르므로 따로 적는다
         line += " | 쓰기실패 %d건" % wrote_failed
@@ -456,8 +516,11 @@ def main():
 
     log(mode, "=" * 58)
     log(mode, "단계 3 실시간 수집 시작 — %s 모드" % cfg["label"])
-    log(mode, "대상 %d개 routeId | 주기 %d초 | 동시 요청 %d개"
-        % (len(targets), cfg["interval"], cfg["workers"]))
+    log(mode, "대상 %d개 routeId | 주기 %d초 | 동시 요청 %d개 | 요청 간격 %.1f초 (한 바퀴 %.0f초)"
+        % (len(targets), cfg["interval"], cfg["workers"], cfg["min_gap"],
+           len(targets) * cfg["min_gap"]))
+    if len(targets) * cfg["min_gap"] > cfg["interval"]:
+        log(mode, "[주의] 요청 간격이 넓어 한 바퀴가 주기를 넘습니다. min_gap 을 줄이십시오.")
     log(mode, "수집 시간대 %s~%s | 일일 예산 %s건" % (DAY_START, DAY_END, format(cfg["budget"], ",")))
     log(mode, "중지: Ctrl+C. 다시 실행하면 그 시점부터 이어서 수집합니다.")
     log(mode, "=" * 58)
@@ -467,6 +530,7 @@ def main():
         log(mode, "오늘 이미 %d건 사용한 기록이 있습니다. 이어서 셉니다." % quota.count)
 
     writer = Writer(mode)
+    pacer = Pacer(cfg["min_gap"])
     next_at = datetime.now()
     fail_streak = 0         # 전 노선이 실패한 순회가 몇 번 이어졌는지
     write_fail_streak = 0   # 저장에 실패한 순회가 몇 번 이어졌는지
@@ -486,7 +550,8 @@ def main():
                 continue
 
             if now >= next_at:
-                result = sweep(service_key, targets, writer, quota, mode, cfg["workers"])
+                result = sweep(service_key, targets, writer, quota, mode,
+                               cfg["workers"], pacer)
                 if result is None:
                     # 예산 소진. 다음 날까지 쉰다
                     writer.close()
