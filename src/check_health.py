@@ -114,22 +114,65 @@ def analyse(mode, day, interval):
 
 
 def check_alerts():
+    # 경보 종류가 늘어도 놓치지 않도록 파일명을 훑는다 (ALERT_core.txt,
+    # ALERT_core_write.txt, ...). 모드별로 하나씩만 보면 새 경보를 못 본다.
     found = []
-    for mode in MODES:
-        path = os.path.join(LOGS_DIR, "ALERT_%s.txt" % mode)
-        if os.path.exists(path):
+    for path in sorted(glob.glob(os.path.join(LOGS_DIR, "ALERT_*.txt"))):
+        try:
             with open(path, encoding="utf-8") as f:
-                found.append((mode, f.read().strip()))
+                found.append((os.path.basename(path), f.read().strip()))
+        except OSError:
+            continue
     out("## 경보")
     out("")
     if not found:
         out("- 활성 경보 없음")
-    for mode, text in found:
-        out("**%s 모드 경보**" % mode)
+    for name, text in found:
+        out("**%s**" % name)
         out("")
         out("```")
         out(text)
         out("```")
+    out("")
+
+
+def check_write_failures(day):
+    """저장 실패를 로그에서 직접 센다.
+
+    호출이 성공해도 저장에 실패하면 순회 로그는 '실패 0건' 으로 찍힌다.
+    CSV 행 수만 봐서는 '수집이 원래 적은 날' 과 구분되지 않으므로 로그를 본다.
+    """
+    out("## 저장 실패")
+    out("")
+    total = 0
+    for mode in MODES:
+        path = os.path.join(LOGS_DIR, "collect_%s_%s.log" % (mode, day))
+        if not os.path.exists(path):
+            out("- %s: 로그 없음" % mode)
+            continue
+        count = 0
+        sample = None
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "쓰기 실패" in line:
+                        count += 1
+                        if sample is None:
+                            sample = line.strip()
+        except OSError:
+            out("- %s: 로그를 읽지 못했습니다" % mode)
+            continue
+        total += count
+        if count:
+            out("- **%s: %s건** — 수집은 됐지만 저장되지 않았습니다" % (mode, format(count, ",")))
+            out("  - `%s`" % sample)
+        else:
+            out("- %s: 없음" % mode)
+    if total:
+        out("")
+        out("> 저장 실패가 있으면 그 시간대 데이터는 남지 않습니다. "
+            "디스크 여유 공간과 data/realtime/ 쓰기 권한을 확인하고, "
+            "코드 문제로 보이면 scripts/restart_tasks.ps1 로 재시작하십시오.")
     out("")
 
 
@@ -192,6 +235,7 @@ def main():
     if arg == "all":
         summarize_all()
     else:
+        check_write_failures(arg)
         check_quota(arg)
         out("## 수집 상태")
         out("")

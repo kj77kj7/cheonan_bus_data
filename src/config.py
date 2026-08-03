@@ -14,10 +14,13 @@ DATA_RAW_DIR = os.path.join(DATA_DIR, "raw")
 LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 
 # --- 공공데이터포털 TAGO 버스정보 서비스 엔드포인트 ---
-BASE_ROUTE_INFO = "http://apis.data.go.kr/1613000/BusRouteInfoInqireService"
-BASE_STATION_INFO = "http://apis.data.go.kr/1613000/BusSttnInfoInqireService"
-BASE_LOCATION_INFO = "http://apis.data.go.kr/1613000/BusLcInfoInqireService"
-BASE_ARRIVAL_INFO = "http://apis.data.go.kr/1613000/ArvlInfoInqireService"
+# https 를 쓴다. 2026-08-02 무렵부터 평문 http(80) 가 응답하지 않는다.
+# TCP 연결은 되고 응답만 오지 않아서, 서버 장애처럼 보이지만 실제로는
+# 같은 요청이 https 로는 0.1초 만에 정상 응답한다.
+BASE_ROUTE_INFO = "https://apis.data.go.kr/1613000/BusRouteInfoInqireService"
+BASE_STATION_INFO = "https://apis.data.go.kr/1613000/BusSttnInfoInqireService"
+BASE_LOCATION_INFO = "https://apis.data.go.kr/1613000/BusLcInfoInqireService"
+BASE_ARRIVAL_INFO = "https://apis.data.go.kr/1613000/ArvlInfoInqireService"
 
 # --- 천안시 도시코드 ---
 CITY_CODE = "34010"

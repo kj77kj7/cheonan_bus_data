@@ -316,7 +316,8 @@ def looks_like_auth_error(text):
 def sweep(service_key, targets, writer, quota, mode, workers):
     """대상 노선을 병렬로 한 바퀴 돌며 수집한다.
 
-    (소요초, 실패수, 대상수, 대표오류) 를 반환한다. 예산이 소진되면 None.
+    (소요초, 실패수, 대상수, 대표오류, 쓰기실패수, 쓰기오류) 를 반환한다.
+    예산이 소진되면 None.
     """
     if quota.remaining() < len(targets) * MAX_ATTEMPTS:
         log(mode, "[한도] 잔여 %d건 — 오늘 수집을 중단합니다." % quota.remaining())
@@ -327,8 +328,9 @@ def sweep(service_key, targets, writer, quota, mode, workers):
     with ThreadPoolExecutor(max_workers=workers) as ex:
         results = list(ex.map(lambda t: (t, fetch_route(service_key, t[1])), targets))
 
-    vehicles = failed = calls = 0
+    vehicles = failed = calls = wrote_failed = 0
     first_err = None
+    write_err = None
     for (routeno, route_id), (rows, used, ts_or_err) in results:
         calls += used
         if rows is None:
@@ -342,18 +344,26 @@ def sweep(service_key, targets, writer, quota, mode, workers):
             writer.write(ts_or_err, routeno, route_id, rows)
             vehicles += len(rows)
         except Exception as e:
-            log(mode, "  쓰기 실패 %s: %r" % (route_id, e))
+            wrote_failed += 1
+            if write_err is None:
+                write_err = e
+            if wrote_failed <= 3:
+                log(mode, "  쓰기 실패 %s: %r" % (route_id, e))
 
     writer.flush()
     quota.spend(calls)
     elapsed = time.time() - started
-    log(mode, "순회 완료 | 차량 %d대 | 호출 %d건 | 실패 %d건 | %.1f초 | 오늘 %d/%d건"
-        % (vehicles, calls, failed, elapsed, quota.count, quota.budget))
-    return elapsed, failed, len(targets), first_err
+    line = ("순회 완료 | 차량 %d대 | 호출 %d건 | 실패 %d건 | %.1f초 | 오늘 %d/%d건"
+            % (vehicles, calls, failed, elapsed, quota.count, quota.budget))
+    if wrote_failed:
+        # 호출은 성공했는데 저장에 실패한 건수. 위 '실패' 와 성격이 다르므로 따로 적는다
+        line += " | 쓰기실패 %d건" % wrote_failed
+    log(mode, line)
+    return elapsed, failed, len(targets), first_err, wrote_failed, write_err
 
 
-def alert_path(mode):
-    return os.path.join(LOGS_DIR, "ALERT_%s.txt" % mode)
+def alert_path(mode, kind=""):
+    return os.path.join(LOGS_DIR, "ALERT_%s%s.txt" % (mode, "_" + kind if kind else ""))
 
 
 def raise_alert(mode, streak, err):
@@ -394,11 +404,43 @@ def raise_alert(mode, streak, err):
         pass
 
 
-def clear_alert(mode):
+def raise_write_alert(mode, streak, count, err):
+    """저장 실패 경보.
+
+    호출이 성공하는데 저장만 실패하면 순회 로그는 '실패 0건' 으로 찍혀 정상처럼
+    보인다. 실제로 이 상태로 하루치가 통째로 날아간 적이 있어(Writer 가 닫힌 채
+    재사용되던 버그), 네트워크 경보와 별개로 즉시 띄운다.
+    """
+    lines = [
+        "수집한 데이터가 저장되지 않고 있습니다.",
+        "발생 시각: %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "모드: %s" % mode,
+        "연속 발생 순회: %d회 (직전 순회 %d건)" % (streak, count),
+        "대표 오류: %r" % err,
+        "",
+        "API 호출은 정상입니다. 저장 단계만 실패하고 있어서 순회 로그에는",
+        "'실패 0건' 으로 보일 수 있습니다. 그대로 두면 데이터가 계속 유실됩니다.",
+        "  1. 디스크 여유 공간 확인",
+        "  2. data/realtime/ 쓰기 권한 확인",
+        "  3. 위 오류가 코드 문제로 보이면 수집기를 재시작 (scripts/restart_tasks.ps1)",
+    ]
+    log(mode, "!" * 58)
+    for line in lines:
+        log(mode, line)
+    log(mode, "!" * 58)
     try:
-        if os.path.exists(alert_path(mode)):
-            os.remove(alert_path(mode))
-            log(mode, "수집이 정상으로 돌아왔습니다. 경보를 해제합니다.")
+        with open(alert_path(mode, "write"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass
+
+
+def clear_alert(mode, kind=""):
+    try:
+        path = alert_path(mode, kind)
+        if os.path.exists(path):
+            os.remove(path)
+            log(mode, "정상으로 돌아왔습니다. 경보를 해제합니다: %s" % os.path.basename(path))
     except OSError:
         pass
 
@@ -426,7 +468,8 @@ def main():
 
     writer = Writer(mode)
     next_at = datetime.now()
-    fail_streak = 0   # 전 노선이 실패한 순회가 몇 번 이어졌는지
+    fail_streak = 0         # 전 노선이 실패한 순회가 몇 번 이어졌는지
+    write_fail_streak = 0   # 저장에 실패한 순회가 몇 번 이어졌는지
 
     try:
         while True:
@@ -451,7 +494,7 @@ def main():
                     next_at = datetime.now()
                     continue
 
-                elapsed, failed, total, first_err = result
+                elapsed, failed, total, first_err, wrote_failed, write_err = result
                 if failed == total:
                     fail_streak += 1
                     if fail_streak == ALERT_AFTER:
@@ -462,6 +505,17 @@ def main():
                     if fail_streak >= ALERT_AFTER:
                         clear_alert(mode)
                     fail_streak = 0
+
+                # 저장 실패는 한 번만 나도 비정상이다. 여기서 안 잡으면 순회 로그가
+                # '실패 0건' 이라 정상으로 보이는 채로 데이터만 사라진다.
+                if wrote_failed:
+                    write_fail_streak += 1
+                    if write_fail_streak == 1 or write_fail_streak % 30 == 0:
+                        raise_write_alert(mode, write_fail_streak, wrote_failed, write_err)
+                else:
+                    if write_fail_streak:
+                        clear_alert(mode, "write")
+                    write_fail_streak = 0
 
                 if elapsed > cfg["interval"]:
                     log(mode, "[주의] 순회에 %.0f초가 걸려 주기 %d초를 넘겼습니다. "
