@@ -232,7 +232,9 @@ class Writer:
 
     def write(self, ts, routeno, route_id, rows):
         day = ts.strftime("%Y%m%d")
-        if day != self.day:
+        # writer 가 None 인지도 함께 본다. 날짜가 같아도 닫혀 있을 수 있다
+        # (수집 시간대가 01:00 에 끝나고 같은 날 05:30 에 재개되는 경우)
+        if day != self.day or self.writer is None:
             self.close()
             log(self.mode, "수집 파일: %s" % self._open(day))
         stamp = ts.isoformat(timespec="seconds")
@@ -259,6 +261,9 @@ class Writer:
             self.fh.close()
             self.fh = None
             self.writer = None
+        # day 를 비우지 않으면, 같은 날짜로 다시 write 할 때 파일을 열지 않고
+        # None 이 된 writer 를 그대로 써서 그날 수집이 통째로 유실된다
+        self.day = None
 
 
 def log(mode, msg):
