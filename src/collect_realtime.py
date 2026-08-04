@@ -567,8 +567,10 @@ def main():
                     elif fail_streak > ALERT_AFTER and fail_streak % 30 == 0:
                         log(mode, "[경고] 전멸이 %d회째 이어지고 있습니다." % fail_streak)
                 else:
-                    if fail_streak >= ALERT_AFTER:
-                        clear_alert(mode)
+                    # streak 조건을 걸면 안 된다. 재시작하면 streak 이 0 부터
+                    # 시작하므로, 죽기 전에 남긴 경보 파일이 영영 안 지워진다.
+                    # 수집이 되고 있으면 경보는 무조건 내린다.
+                    clear_alert(mode)
                     fail_streak = 0
 
                 # 저장 실패는 한 번만 나도 비정상이다. 여기서 안 잡으면 순회 로그가
@@ -578,8 +580,7 @@ def main():
                     if write_fail_streak == 1 or write_fail_streak % 30 == 0:
                         raise_write_alert(mode, write_fail_streak, wrote_failed, write_err)
                 else:
-                    if write_fail_streak:
-                        clear_alert(mode, "write")
+                    clear_alert(mode, "write")   # 위와 같은 이유로 조건 없이 내린다
                     write_fail_streak = 0
 
                 if elapsed > cfg["interval"]:
