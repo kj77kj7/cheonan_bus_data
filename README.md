@@ -2,9 +2,15 @@
 
 천안시 시내버스 실시간 운행 데이터 수집·분석 파이프라인.
 
-2026년 천안시 AI·데이터 기반 정책 아이디어 경진대회 출품용. 노선별 실측
-배차간격·정시성 산출과, 버스 도착 지연 예측·정류장 수요 예측 모델 개발을
-최종 목표로 한다. 실시간 데이터는 소급 수집이 불가능하므로 수집 착수가 최우선.
+2026년 천안시 AI·데이터 기반 정책 아이디어 경진대회 출품용.
+
+**배차를 줄이거나 노선을 조정하면 이용객이 얼마나 늘어나는가**를 실측으로
+추정하고, 개선 시나리오별 증가량과 우선순위를 내는 것이 최종 목표다.
+버스 위치 실시간 수집으로 **실측 배차간격**을, 교통카드 빅데이터(STCIS)로
+**이용량**을 확보해 둘을 잇는다.
+
+> 목표가 한 번 바뀌었다. 초기에는 도착 지연 예측과 2024년 개편 전후 DID 를
+> 본체로 잡았으나 둘 다 폐기했다. 경위는 [docs/HANDOFF.md](docs/HANDOFF.md) 2장.
 
 외부 패키지 없이 **파이썬 표준 라이브러리만** 사용한다.
 
@@ -14,8 +20,8 @@
 
 | 문서 | 내용 |
 |---|---|
-| [docs/HANDOFF.md](docs/HANDOFF.md) | 현재 상태, 운영 방법, 겪은 함정, 결정 대기 항목 |
-| [docs/DESIGN.md](docs/DESIGN.md) | 데이터 모델, 지표 정의, DID 설계, 진행 순서 |
+| [docs/HANDOFF.md](docs/HANDOFF.md) | 현재 상태, 목표 변경 경위, 운영 방법, 겪은 함정 |
+| [docs/DESIGN.md](docs/DESIGN.md) | 탄력성 패널 설계, 데이터 모델, 진행 순서 |
 | [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) | 추가로 필요한 데이터와 확보 경로 |
 | [docs/DELIVERABLES.md](docs/DELIVERABLES.md) | 완성 시 결과물 |
 
@@ -111,9 +117,28 @@ cheonan-bus/
   logs/                  수집 로그·경보·리포트 (git 제외)
 ```
 
+### 단계 4 — 교통카드 승하차 (STCIS)
+
+교통카드 빅데이터 시스템에서 노선별·정류장별 이용량을 받는다. 공개 API 가 아니라
+로그인 세션으로 도는 화면이라, `.env` 에 `STCIS_COOKIE` 를 넣고 돌린다.
+
+```
+python src/fetch_route_ridership.py routes                      # 노선 ID 목록 (1회)
+python src/fetch_route_ridership.py data 2026-08-01 2026-08-14  # 한 구간
+python src/fetch_ridership.py stops                             # 정류장 ID (1회)
+python src/fetch_ridership.py data 2026-08-01 2026-08-14
+```
+
+> **하루 총 요청 수에 상한이 있다.** 1.5초 간격으로 수백 건을 보냈더니 STCIS 가
+> 그 PC 를 통째로 막았다. 간격은 3초로 두었고, 기간을 나눠 여러 날에 걸쳐 받는다.
+> 수록 기간은 **2024년 4~5월부터**다. 그 이전은 서버에 데이터가 없다.
+
 ## 진행 상황
 
 - 단계 1~2 **완료**
-- 단계 3 **가동 중** — 2026-07-31 시작, 20일차 기준 core 925,602행 / network 287,837행
-- 단계 4 (기상청 ASOS) — 미착수. [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) A-1 참고
-- 분석 단계 — [docs/DESIGN.md](docs/DESIGN.md) 8장의 순서를 따른다
+- 단계 3 **가동 중** — 2026-07-31 시작
+- 단계 4 **수집기 완성·검증** — 사이트가 내보낸 CSV 와 대조해 일치 확인
+- 분석 단계 — [docs/DESIGN.md](docs/DESIGN.md) 9장의 순서를 따른다
+
+**다음 관문은 정보공개청구 하나다** — 2024~2026 노선별 배차간격 변경 이력.
+없으면 서비스 탄력성을 추정할 수 없다. [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) A-1.
