@@ -52,7 +52,11 @@ DATA_COLUMNS = ["route_id", "route_no", "stg_arr_nma", "date", "hour", "use_cnt"
 HOURS = ["%02d" % h for h in range(24)]
 
 # 쪽 번호 파라미터 이름이 캡처에 안 잡혔다. 흔한 것부터 넣어본다.
+# 실행해 보니 첫 후보인 pageIndex 가 맞았다.
 PAGE_PARAM_CANDIDATES = ["pageIndex", "pageNo", "currentPageNo", "page", "pageNum"]
+
+# 철도 노선이 목록에 섞여 나온다. 시내버스 분석 대상이 아니다.
+NON_BUS_ROUTE_NOS = {"경부선", "장항선"}
 
 CHECKBOX_RE = re.compile(r'name="chkBusLine"\s+value="([^"]*)"')
 ROW_RE = re.compile(r"<tr>(.*?)</tr>", re.S)
@@ -213,6 +217,9 @@ def stage_routes(cookie):
             if page % 5 == 0 or page == last_page:
                 print("  %d/%d쪽  누적 고유 노선 %d개" % (page, last_page, len(found)))
 
+    dropped = [r for r in found.values() if r["route_no"] in NON_BUS_ROUTE_NOS]
+    for route in dropped:
+        del found[route["route_id"]]
     ordered = sorted(found.values(), key=lambda r: (len(r["route_no"]), r["route_no"]))
     with open(ROUTE_IDS_CSV, "w", encoding="utf-8-sig", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=ROUTE_ID_COLUMNS,
@@ -222,6 +229,9 @@ def stage_routes(cookie):
 
     print()
     print("고유 노선 %d개를 %s 에 저장했습니다." % (len(ordered), ROUTE_IDS_CSV))
+    if dropped:
+        print("철도 노선 %d개는 뺐습니다: %s"
+              % (len(dropped), ", ".join(r["route_no"] for r in dropped)))
     outside = [r for r in ordered if r["tcbo_id"] != "03"]
     if outside:
         print("[참고] 천안 운수사(03)가 아닌 노선 %d개가 섞여 있습니다: %s"
@@ -312,6 +322,13 @@ def main():
             return stage_routes(cookie)
         except SessionExpired as e:
             print("[중단] 세션이 만료됐습니다 (%s)." % e)
+            return 1
+        except IOError as e:
+            # 첫 검색 요청만 감싸는 곳이 없어서, 여기서 안 받으면 안내
+            # 문구 대신 트레이스백이 그대로 튀어나온다.
+            print("[중단] STCIS 에 닿지 못했습니다 (%s)." % e)
+            print("       잠시 뒤 다시 실행하십시오. 그래도 안 되면")
+            print("       .env 의 STCIS_COOKIE 가 살아 있는지 확인하십시오.")
             return 1
 
     if len(sys.argv) == 4:

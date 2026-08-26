@@ -30,7 +30,7 @@ import os
 import re
 import sys
 import time
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -61,13 +61,16 @@ STOP_ID_COLUMNS = ["query_nm", "sttn_id", "tcbo_id", "excclc_area_cd",
 HOURS = ["%02d" % h for h in range(4, 24)] + ["00", "01", "02", "03"]
 VALUES_PER_ROW = len(HOURS) * 2
 
-# 개편 전후를 견주려면 계절과 학사일정을 맞춰야 한다. 개편 시행일이
-# 2024-01-27 이므로 2023 년이 '전', 나머지가 '후' 다. 마지막 기간은
+# 해마다 같은 달을 골라 계절과 학사일정을 맞춘다. 마지막 구간은
 # 실시간 수집분과 겹치도록 잡았다.
+#
+# 2023 년은 뺐다. STCIS 에 그 시기 데이터가 아예 없다 — 2023-05·09·11·12
+# 와 2024-01·02·03 을 직접 찔러 전부 0건이었고, 2024-05 는 같은 파라미터로
+# 260건이 나왔다. 요청이 잘못된 게 아니라 데이터가 없는 것이다. 시작은
+# 2024-03-14 이후 ~ 2024-05-06 이전 어딘가다 (4월 중 정확한 날짜는 미확인).
+# 노선 개편 시행일(2024-01-27)보다 늦으므로, STCIS 승하차만으로는
+# 개편 전후 비교가 성립하지 않는다.
 PERIODS = [
-    ("2023-05-08", "2023-05-21"),
-    ("2023-09-04", "2023-09-17"),
-    ("2023-11-06", "2023-11-19"),
     ("2024-05-06", "2024-05-19"),
     ("2024-09-02", "2024-09-15"),
     ("2025-05-12", "2025-05-25"),
@@ -78,7 +81,10 @@ PERIODS = [
 
 TIMEOUT = 40
 MAX_ATTEMPTS = 3
-MIN_GAP = 1.5        # 요청 시작 사이 최소 간격(초). 공공 시스템이라 넉넉히 둔다.
+MIN_GAP = 3.0        # 요청 시작 사이 최소 간격(초).
+                     # 1.5 초로 수백 건을 보냈더니 STCIS 가 그 PC 를 통째로
+                     # 막았다. 루트 페이지까지 응답하지 않았다. 간격만이
+                     # 아니라 하루 총량에도 상한이 있는 것으로 보인다.
 
 CHECKBOX_RE = re.compile(r'name="chkSttn"\s+value="([^"]*)"')
 ROW_RE = re.compile(r"<tr>(.*?)</tr>", re.S)
@@ -133,7 +139,11 @@ def post(url, params, cookie, pacer):
             if e.code in (401, 403):
                 raise SessionExpired("HTTP %s" % e.code)
             last = e
-        except URLError as e:
+        # URLError 만 잡으면 안 된다. 연결은 됐는데 본문이 안 오면
+        # response.read() 가 socket.timeout 을 그대로 올리는데, 그것은
+        # URLError 가 아니라서 재시도를 통째로 비껴간다. STCIS 가
+        # 느려질 때 실제로 이쪽으로 터졌다. 둘의 공통 조상으로 받는다.
+        except OSError as e:
             last = e
         if attempt < MAX_ATTEMPTS:
             time.sleep(2.0 * attempt)
