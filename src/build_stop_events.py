@@ -64,11 +64,19 @@ def parse_ts(text):
 
 
 def load_day(path):
-    """한 날짜 파일을 읽어 (routeid, vehicleno) 별로 관측을 모은다."""
+    """한 날짜 파일을 읽어 (routeid, vehicleno) 별로 관측을 모은다.
+
+    수집기가 BOM 을 붙여 쓰므로 utf-8-sig 로 읽어야 한다. utf-8 로 읽으면
+    첫 컬럼명이 '\ufeffts' 가 되어 row.get("ts") 가 늘 None 이 되고, 데이터가
+    아무리 많아도 한 건도 안 남는다. 오류는 안 나고 결과만 비는 종류라
+    알아채기 어렵다.
+    """
     trips = {}
     bad = 0
-    with open(path, encoding="utf-8", newline="") as f:
+    total = 0
+    with open(path, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
+            total += 1
             ts = parse_ts((row.get("ts") or "").strip())
             vehicle = (row.get("vehicleno") or "").strip()
             ordtext = (row.get("nodeord") or "").strip()
@@ -83,6 +91,12 @@ def load_day(path):
                 "nodenm": (row.get("nodenm") or "").strip(),
                 "routeno": (row.get("routeno") or "").strip(),
             })
+    # 한 건도 못 건졌으면 컬럼 이름이 어긋난 것이지 데이터가 나쁜 게 아니다.
+    # 조용히 빈 결과를 내보내면 뒤 단계까지 헛돌므로 여기서 멈춘다.
+    if total and not trips:
+        raise ValueError("%d행을 읽었으나 쓸 수 있는 행이 하나도 없습니다. "
+                         "컬럼 이름을 확인하십시오 (기대: %s)"
+                         % (total, ", ".join(["ts", "vehicleno", "nodeord"])))
     return trips, bad
 
 
@@ -178,7 +192,13 @@ def main():
 
         for filename in files:
             day = filename.split("_")[1].split(".")[0]
-            trips, bad = load_day(os.path.join(REALTIME_DIR, filename))
+            try:
+                trips, bad = load_day(os.path.join(REALTIME_DIR, filename))
+            except ValueError as e:
+                print()
+                print("[중단] %s: %s" % (filename, e))
+                print("       수집기가 쓴 파일이 맞는지 확인하십시오.")
+                return 1
             obs = sum(len(v) for v in trips.values())
             events_today = 0
             trips_today = 0
