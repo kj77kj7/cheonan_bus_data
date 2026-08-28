@@ -8,6 +8,7 @@
 | [DESIGN.md](DESIGN.md) | 분석·모델을 만들 때 | 데이터 모델 3계층, 지표 정의, DID 설계, 모듈 구조, 진행 순서 |
 | [DATA_SOURCES.md](DATA_SOURCES.md) | 데이터를 더 구할 때 | 추가로 필요한 데이터와 확보 경로·우선순위 |
 | [DELIVERABLES.md](DELIVERABLES.md) | 목표를 확인할 때 | 완성 시 결과물, 지금 가능한 것과 결정에 달린 것 |
+| [DATA_MANIFEST.md](DATA_MANIFEST.md) | **데이터를 쓰기 전에** | 일자별 완전성 판정, 분석용 화이트리스트, 결손 사유 |
 
 ## 빠른 요약
 

@@ -18,6 +18,7 @@
 | [docs/DESIGN.md](docs/DESIGN.md) | 데이터 모델, 지표 정의, DID 설계, 진행 순서 |
 | [docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) | 추가로 필요한 데이터와 확보 경로 |
 | [docs/DELIVERABLES.md](docs/DELIVERABLES.md) | 완성 시 결과물 |
+| [docs/DATA_MANIFEST.md](docs/DATA_MANIFEST.md) | 일자별 완전성 판정과 분석용 화이트리스트 |
 
 ## 데이터 출처
 
