@@ -61,15 +61,14 @@ STOP_ID_COLUMNS = ["query_nm", "sttn_id", "tcbo_id", "excclc_area_cd",
 HOURS = ["%02d" % h for h in range(4, 24)] + ["00", "01", "02", "03"]
 VALUES_PER_ROW = len(HOURS) * 2
 
-# 해마다 같은 달을 골라 계절과 학사일정을 맞춘다. 마지막 구간은
-# 실시간 수집분과 겹치도록 잡았다.
+# 해마다 같은 달을 골라 계절과 학사일정을 맞춘다. 마지막 구간은 실시간
+# 수집분과 겹치도록 잡았다.
 #
 # 2023 년은 뺐다. STCIS 에 그 시기 데이터가 아예 없다 — 2023-05·09·11·12
-# 와 2024-01·02·03 을 직접 찔러 전부 0건이었고, 2024-05 는 같은 파라미터로
-# 260건이 나왔다. 요청이 잘못된 게 아니라 데이터가 없는 것이다. 시작은
-# 2024-03-14 이후 ~ 2024-05-06 이전 어딘가다 (4월 중 정확한 날짜는 미확인).
-# 노선 개편 시행일(2024-01-27)보다 늦으므로, STCIS 승하차만으로는
-# 개편 전후 비교가 성립하지 않는다.
+# 와 2024-01·02·03 이 전부 0건인데 2024-05 는 같은 파라미터로 260건이
+# 나왔다. 요청이 잘못된 게 아니라 데이터가 없는 것이다. 시작은 2024-03-14
+# 이후 ~ 2024-05-06 이전 어딘가다. 노선 개편 시행일(2024-01-27)보다 늦어
+# STCIS 승하차만으로는 개편 전후 비교가 성립하지 않는다.
 PERIODS = [
     ("2024-05-06", "2024-05-19"),
     ("2024-09-02", "2024-09-15"),
@@ -81,10 +80,14 @@ PERIODS = [
 
 TIMEOUT = 40
 MAX_ATTEMPTS = 3
-MIN_GAP = 3.0        # 요청 시작 사이 최소 간격(초).
-                     # 1.5 초로 수백 건을 보냈더니 STCIS 가 그 PC 를 통째로
-                     # 막았다. 루트 페이지까지 응답하지 않았다. 간격만이
-                     # 아니라 하루 총량에도 상한이 있는 것으로 보인다.
+MIN_GAP = 2.0        # 요청 시작 사이 최소 간격(초). 공공 시스템이라 넉넉히 둔다.
+
+# STCIS 는 요청이 몰리면 TCP 핸드셰이크 자체를 끊는다. HTTP 429 가 아니라
+# 연결이 안 되는 것이라, 애플리케이션에서는 WinError 10060 으로 보인다.
+# 실측: 6분쯤 막혔다가 저절로 풀렸고, 90초를 쉰 뒤에는 곧바로 응답했다.
+# 막힌 동안 계속 두드려 봐야 시간만 버리므로, 연속 실패가 쌓이면 물러선다.
+BLOCK_STREAK = 3               # 이만큼 연속 실패하면 막힌 것으로 본다
+COOLDOWNS = [120, 300, 600]    # 물러서는 시간(초). 반복될수록 길게 쉰다.
 
 CHECKBOX_RE = re.compile(r'name="chkSttn"\s+value="([^"]*)"')
 ROW_RE = re.compile(r"<tr>(.*?)</tr>", re.S)
@@ -115,10 +118,10 @@ class SessionExpired(Exception):
     pass
 
 
-def post(url, params, cookie, pacer):
+def post(url, params, cookie, pacer, attempts=MAX_ATTEMPTS):
     body = urlencode(params, encoding="utf-8").encode("utf-8")
     last = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         pacer.wait()
         request = Request(url, data=body, method="POST")
         request.add_header("Content-Type",
@@ -139,13 +142,13 @@ def post(url, params, cookie, pacer):
             if e.code in (401, 403):
                 raise SessionExpired("HTTP %s" % e.code)
             last = e
-        # URLError 만 잡으면 안 된다. 연결은 됐는데 본문이 안 오면
-        # response.read() 가 socket.timeout 을 그대로 올리는데, 그것은
-        # URLError 가 아니라서 재시도를 통째로 비껴간다. STCIS 가
-        # 느려질 때 실제로 이쪽으로 터졌다. 둘의 공통 조상으로 받는다.
+        # URLError 만 잡으면 안 된다. 연결은 됐는데 본문이 안 오는 경우
+        # response.read() 가 socket.timeout 을 그대로 올리고, 그것은
+        # URLError 가 아니라서 재시도 없이 통과해 버린다. STCIS 가 느려질
+        # 때 실제로 이쪽으로 터졌다. 둘의 공통 조상인 OSError 로 받는다.
         except OSError as e:
             last = e
-        if attempt < MAX_ATTEMPTS:
+        if attempt < attempts:
             time.sleep(2.0 * attempt)
     raise IOError("요청 실패: %s" % last)
 

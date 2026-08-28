@@ -26,11 +26,13 @@ import json
 import os
 import re
 import sys
+import time
 
 from collect_realtime import Pacer
 from config import DATA_DIR, LOGS_DIR
-from fetch_ridership import (BASE, MIN_GAP, PERIODS, SessionExpired,
-                             load_cookie, post, text_of)
+from fetch_ridership import (BASE, BLOCK_STREAK, COOLDOWNS, MAX_ATTEMPTS,
+                             MIN_GAP, PERIODS, SessionExpired, load_cookie,
+                             post, text_of)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -52,8 +54,10 @@ DATA_COLUMNS = ["route_id", "route_no", "stg_arr_nma", "date", "hour", "use_cnt"
 HOURS = ["%02d" % h for h in range(24)]
 
 # 쪽 번호 파라미터 이름이 캡처에 안 잡혔다. 흔한 것부터 넣어본다.
-# 실행해 보니 첫 후보인 pageIndex 가 맞았다.
 PAGE_PARAM_CANDIDATES = ["pageIndex", "pageNo", "currentPageNo", "page", "pageNum"]
+
+# 차단은 시간이 지나면 풀리므로, 한 바퀴에 못 받은 것은 쉬었다 다시 돈다.
+MAX_PASSES = 3
 
 # 철도 노선이 목록에 섞여 나온다. 시내버스 분석 대상이 아니다.
 NON_BUS_ROUTE_NOS = {"경부선", "장항선"}
@@ -239,6 +243,79 @@ def stage_routes(cookie):
     return 0
 
 
+def fetch_period(routes, path, from_day, to_day, cookie, pacer):
+    """노선 목록을 한 바퀴 돈다.
+
+    세션이 만료되면 None, 아니면 (받은 수, 실패한 수) 를 돌려준다.
+    """
+    is_new = not os.path.exists(path)
+    got = failed = 0
+    # 막혔다고 판단한 뒤에는 한 번만 찔러 본다. 어차피 TCP 가 안 열리는
+    # 상태라, 3회씩 두드리면 노선 하나에 70초씩 버린다.
+    streak = 0
+    cool = 0
+    with open(path, "a", encoding="utf-8-sig", newline="") as out:
+        writer = csv.DictWriter(out, fieldnames=DATA_COLUMNS,
+                                extrasaction="ignore")
+        if is_new:
+            writer.writeheader()
+        for i, route in enumerate(routes, 1):
+            try:
+                payload = post(INDICATOR_URL,
+                               indicator_params(route, from_day, to_day),
+                               cookie, pacer,
+                               attempts=1 if streak else MAX_ATTEMPTS)
+                rows = parse_indicator(payload)
+            except SessionExpired as e:
+                print()
+                print("[중단] 세션이 만료됐습니다 (%s)." % e)
+                print("       .env 의 STCIS_COOKIE 를 갱신하고 다시 실행하면")
+                print("       받은 지점부터 이어서 받습니다.")
+                return None
+            except (IOError, ValueError) as e:
+                print("  [실패] %s(%s): %s"
+                      % (route["route_no"], route["route_id"], e))
+                failed += 1
+                streak += 1
+                if streak >= BLOCK_STREAK:
+                    nap = COOLDOWNS[min(cool, len(COOLDOWNS) - 1)]
+                    print("  [대기] %d회 연속 실패. 막힌 것으로 보고 %d초 쉽니다."
+                          % (streak, nap))
+                    time.sleep(nap)
+                    cool += 1
+                    streak = 0
+                continue
+            streak = 0
+            cool = 0
+
+            # 응답에 없는 칸은 0 이다. 일자별로 24시간을 채워 표를 온전히 만든다.
+            seen = {(r["date"], r["hour"]): r["use_cnt"] for r in rows}
+            dates = sorted({r["date"] for r in rows})
+            for date in dates:
+                for hour in HOURS:
+                    writer.writerow({
+                        "route_id": route["route_id"],
+                        "route_no": route["route_no"],
+                        "stg_arr_nma": route["stg_arr_nma"],
+                        "date": date, "hour": hour,
+                        "use_cnt": seen.get((date, hour), 0),
+                    })
+            out.flush()
+            got += 1
+            if i % 25 == 0 or i == len(routes):
+                print("  %d/%d  최근: %s번" % (i, len(routes), route["route_no"]))
+    return got, failed
+
+
+def remaining(routes, path):
+    """CSV 에 아직 없는 노선을 돌려준다. 이어받기의 근거다."""
+    done = set()
+    if os.path.exists(path):
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            done = {row["route_id"] for row in csv.DictReader(f)}
+    return [r for r in routes if r["route_id"] not in done]
+
+
 def stage_data(cookie, periods):
     if not os.path.exists(ROUTE_IDS_CSV):
         print("[오류] %s 가 없습니다." % ROUTE_IDS_CSV)
@@ -254,55 +331,35 @@ def stage_data(cookie, periods):
     for from_day, to_day in periods:
         path = os.path.join(OUT_DIR, "route_%s_%s.csv"
                             % (from_day.replace("-", ""), to_day.replace("-", "")))
-        done = set()
-        if os.path.exists(path):
-            with open(path, encoding="utf-8-sig", newline="") as f:
-                done = {row["route_id"] for row in csv.DictReader(f)}
-        todo = [r for r in routes if r["route_id"] not in done]
-        print()
-        print("[%s ~ %s] 남은 노선 %d개" % (from_day, to_day, len(todo)))
-        if not todo:
-            continue
+        for pass_no in range(1, MAX_PASSES + 1):
+            todo = remaining(routes, path)
+            print()
+            if not todo:
+                if pass_no == 1:
+                    print("[%s ~ %s] 받을 것이 없습니다." % (from_day, to_day))
+                break
+            print("[%s ~ %s] %d바퀴째 / 남은 노선 %d개"
+                  % (from_day, to_day, pass_no, len(todo)))
+            if pass_no > 1:
+                # 앞 바퀴에서 막혔다는 뜻이다. 풀릴 시간을 준다.
+                nap = COOLDOWNS[min(pass_no - 2, len(COOLDOWNS) - 1)]
+                print("  %d초 쉬었다 시작합니다." % nap)
+                time.sleep(nap)
 
-        is_new = not os.path.exists(path)
-        with open(path, "a", encoding="utf-8-sig", newline="") as out:
-            writer = csv.DictWriter(out, fieldnames=DATA_COLUMNS,
-                                    extrasaction="ignore")
-            if is_new:
-                writer.writeheader()
-            for i, route in enumerate(todo, 1):
-                try:
-                    payload = post(INDICATOR_URL,
-                                   indicator_params(route, from_day, to_day),
-                                   cookie, pacer)
-                    rows = parse_indicator(payload)
-                except SessionExpired as e:
-                    print()
-                    print("[중단] 세션이 만료됐습니다 (%s)." % e)
-                    print("       .env 의 STCIS_COOKIE 를 갱신하고 다시 실행하면")
-                    print("       받은 지점부터 이어서 받습니다.")
-                    return 1
-                except (IOError, ValueError) as e:
-                    print("  [실패] %s(%s): %s"
-                          % (route["route_no"], route["route_id"], e))
-                    continue
+            result = fetch_period(todo, path, from_day, to_day, cookie, pacer)
+            if result is None:
+                return 1
+            got, failed = result
+            print("  %d바퀴째 결과: %d개 받음, %d개 실패" % (pass_no, got, failed))
+            if not failed:
+                break
 
-                # 응답에 없는 칸은 0 이다. 일자별로 24시간을 채워 표를 온전히 만든다.
-                seen = {(r["date"], r["hour"]): r["use_cnt"] for r in rows}
-                dates = sorted({r["date"] for r in rows})
-                for date in dates:
-                    for hour in HOURS:
-                        writer.writerow({
-                            "route_id": route["route_id"],
-                            "route_no": route["route_no"],
-                            "stg_arr_nma": route["stg_arr_nma"],
-                            "date": date, "hour": hour,
-                            "use_cnt": seen.get((date, hour), 0),
-                        })
-                out.flush()
-                if i % 25 == 0 or i == len(todo):
-                    print("  %d/%d  최근: %s번" % (i, len(todo), route["route_no"]))
         print("  저장: %s" % path)
+        left = remaining(routes, path)
+        if left:
+            print("  [주의] %d개 노선을 못 받았습니다: %s"
+                  % (len(left), ", ".join(r["route_no"] for r in left[:10])))
+            print("         같은 명령을 다시 실행하면 이것만 이어서 받습니다.")
     return 0
 
 
@@ -324,8 +381,8 @@ def main():
             print("[중단] 세션이 만료됐습니다 (%s)." % e)
             return 1
         except IOError as e:
-            # 첫 검색 요청만 감싸는 곳이 없어서, 여기서 안 받으면 안내
-            # 문구 대신 트레이스백이 그대로 튀어나온다.
+            # 첫 검색 요청은 감싸는 곳이 없어서, 여기서 안 받으면
+            # 안내 문구 대신 트레이스백이 그대로 튀어나온다.
             print("[중단] STCIS 에 닿지 못했습니다 (%s)." % e)
             print("       잠시 뒤 다시 실행하십시오. 그래도 안 되면")
             print("       .env 의 STCIS_COOKIE 가 살아 있는지 확인하십시오.")
