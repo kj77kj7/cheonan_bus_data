@@ -8,9 +8,17 @@
 같은 차량의 다음 회차가 아니라 뒤따라오는 다른 운행이어야 하므로, 운행
 단위(trip_key)로 접은 뒤 정류장별로 다시 늘어놓는다.
 
-번칭(bunching)은 배차가 공표값의 30% 미만으로 붙은 사건이다. 두 대가 붙어
-오고 다음이 한참 안 오는 현상이라, 평균 배차가 지켜져도 체감은 나빠진다.
-'배차 10분' 이라 안내하면서 실제로는 20분을 기다리게 만드는 주범이다.
+번칭(bunching)은 배차가 붙어 버린 사건이다. 두 대가 몰려 오고 다음이 한참
+안 오는 현상이라, 평균 배차가 지켜져도 체감은 나빠진다. 두 가지로 잰다.
+
+- 공표 대비: 공표 배차의 30% 미만. 계획과 실제의 괴리를 곧바로 보여준다
+- 실측 대비: 그 노선 실측 중앙값의 30% 미만. 공표값이 없거나 못 믿을 때도
+  쓸 수 있어 전 노선에 적용된다
+
+공표값을 그대로 믿으면 안 된다. TAGO 의 intervaltime 은 노선마다 의미가
+섞여 있어서, 402번은 685분(운행시간대 전체와 같다), 82번은 460분으로
+들어와 있다. 배차간격이 아니라 다른 값이다. 이런 노선을 그대로 두면 실측
+59분이 전부 번칭으로 찍혀 번칭률 100% 가 나온다.
 
 산출물
     data/processed/headway.csv           배차 사건 1건 = 1행
@@ -38,18 +46,26 @@ BY_ROUTE_CSV = os.path.join(OUT_DIR, "headway_by_route.csv")
 
 HEADWAY_COLUMNS = ["routeid", "routeno", "nodeord", "nodeid", "nodenm",
                    "prev_ts", "pass_ts", "headway_sec", "date", "dow", "hour",
-                   "official_min", "ratio", "is_bunching"]
-BY_ROUTE_COLUMNS = ["routeid", "routeno", "official_min", "n_headway",
-                    "median_min", "p90_min", "iqr_min", "cv",
-                    "bunching_rate", "long_wait_rate", "gap_vs_official"]
+                   "official_min", "ratio", "is_bunching",
+                   "ratio_obs", "is_bunching_obs"]
+BY_ROUTE_COLUMNS = ["routeid", "routeno", "official_min", "official_dropped",
+                    "n_headway", "median_min", "p90_min", "iqr_min", "cv",
+                    "bunching_rate", "bunching_rate_obs", "long_wait_rate",
+                    "gap_vs_official"]
 
 # 이 밖은 배차로 보지 않는다. 너무 짧으면 같은 운행이 두 번 잡힌 것이고,
 # 너무 길면 운행이 끊긴 구간(점심 공백·막차 이후)이다.
 MIN_HEADWAY_SEC = 60
 MAX_HEADWAY_SEC = 3 * 3600
 
-BUNCHING_RATIO = 0.30      # 공표값의 30% 미만이면 붙어 온 것으로 본다
+BUNCHING_RATIO = 0.30      # 이 비율 미만이면 붙어 온 것으로 본다
 LONG_WAIT_RATIO = 2.0      # 공표값의 2배를 넘으면 하염없이 기다린 것
+
+# 공표 배차가 운행시간대의 1/3 을 넘으면 하루 세 번도 안 다닌다는 뜻이다.
+# 시내버스로는 있을 수 없으므로 배차간격이 아닌 다른 값으로 본다.
+MAX_OFFICIAL_SHARE = 1.0 / 3
+# 첫차·막차를 모르는 노선에 쓸 절대 상한(분).
+MAX_OFFICIAL_MIN = 180
 
 DOW = ["월", "화", "수", "목", "금", "토", "일"]
 
@@ -58,21 +74,50 @@ def percentile(values, q):
     """정렬된 값에서 q 분위(0~1). 표본이 적어 보간 없이 가까운 쪽을 쓴다."""
     if not values:
         return None
-    index = int(round(q * (len(values) - 1)))
-    return values[index]
+    return values[int(round(q * (len(values) - 1)))]
+
+
+def to_minutes(text):
+    """'0610' 을 분으로. 못 읽으면 None."""
+    digits = "".join(c for c in str(text or "") if c.isdigit())
+    if len(digits) != 4:
+        return None
+    hour, minute = int(digits[:2]), int(digits[2:])
+    return hour * 60 + minute if hour < 24 and minute < 60 else None
 
 
 def load_official():
-    """공표 배차간격(분). 평일 값을 쓴다."""
+    """공표 배차간격(분). 배차로 볼 수 없는 값은 걸러낸다.
+
+    돌려주는 것은 {routeid: (분 또는 None, 걸러낸 이유)}.
+    """
     official = {}
     if not os.path.exists(DETAIL_CSV):
         return official
     with open(DETAIL_CSV, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
-            text = (row.get("intervaltime") or "").strip()
-            digits = "".join(c for c in text if c.isdigit())
-            if digits:
-                official[(row.get("routeid") or "").strip()] = int(digits)
+            routeid = (row.get("routeid") or "").strip()
+            digits = "".join(c for c in (row.get("intervaltime") or "")
+                             if c.isdigit())
+            if not digits:
+                official[routeid] = (None, "값 없음")
+                continue
+            minutes = int(digits)
+
+            start = to_minutes(row.get("startvehicletime"))
+            end = to_minutes(row.get("endvehicletime"))
+            span = None
+            if start is not None and end is not None:
+                span = end - start
+                if span < 0:          # 막차가 자정을 넘는 노선
+                    span += 24 * 60
+
+            if span and minutes > span * MAX_OFFICIAL_SHARE:
+                official[routeid] = (None, "운행시간대 %d분의 1/3 초과" % span)
+            elif span is None and minutes > MAX_OFFICIAL_MIN:
+                official[routeid] = (None, "%d분 초과" % MAX_OFFICIAL_MIN)
+            else:
+                official[routeid] = (minutes, "")
     return official
 
 
@@ -92,12 +137,35 @@ def load_events():
             if trip_stop in seen:
                 continue
             seen.add(trip_stop)
-            key = (row["routeid"], nodeord)
-            stops.setdefault(key, []).append({
+            stops.setdefault((row["routeid"], nodeord), []).append({
                 "ts": ts, "routeno": row["routeno"],
                 "nodeid": row["nodeid"], "nodenm": row["nodenm"],
             })
     return stops
+
+
+def collect_headways(stops):
+    """배차 사건을 모은다. 노선별 실측 중앙값을 알아야 번칭을 매길 수 있어
+    한 번에 다 모은 뒤 두 번째 바퀴에서 값을 채운다."""
+    events = []
+    short = long = 0
+    for (routeid, nodeord), passes in sorted(stops.items()):
+        passes.sort(key=lambda p: p["ts"])
+        for prev, cur in zip(passes, passes[1:]):
+            gap = (cur["ts"] - prev["ts"]).total_seconds()
+            if gap < MIN_HEADWAY_SEC:
+                short += 1
+                continue
+            if gap > MAX_HEADWAY_SEC:
+                long += 1
+                continue
+            events.append({
+                "routeid": routeid, "routeno": cur["routeno"],
+                "nodeord": nodeord, "nodeid": cur["nodeid"],
+                "nodenm": cur["nodenm"],
+                "prev_ts": prev["ts"], "pass_ts": cur["ts"], "gap": gap,
+            })
+    return events, short, long
 
 
 def main():
@@ -110,56 +178,66 @@ def main():
     if not official:
         print("[주의] %s 를 못 읽어 공표 배차 비교를 건너뜁니다." % DETAIL_CSV)
 
-    stops = load_events()
-    os.makedirs(OUT_DIR, exist_ok=True)
+    events, short, long = collect_headways(load_events())
+    if not events:
+        print("[오류] 배차 사건이 하나도 없습니다.")
+        print("       같은 정류장을 두 번 이상 지난 기록이 있어야 합니다.")
+        return 1
 
+    # 노선별 실측 중앙값. 공표값을 못 믿는 노선의 번칭 기준이 된다.
+    gaps_by_route = {}
+    for event in events:
+        gaps_by_route.setdefault(event["routeid"], []).append(event["gap"])
+    median_by_route = {rid: percentile(sorted(g), 0.5)
+                       for rid, g in gaps_by_route.items()}
+
+    os.makedirs(OUT_DIR, exist_ok=True)
     by_route = {}
-    written = dropped_short = dropped_long = 0
 
     with open(HEADWAY_CSV, "w", encoding="utf-8-sig", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=HEADWAY_COLUMNS,
                                 extrasaction="ignore")
         writer.writeheader()
+        for event in events:
+            routeid = event["routeid"]
+            gap = event["gap"]
+            official_min, reason = official.get(routeid, (None, "노선 정보 없음"))
+            obs_median = median_by_route[routeid]
 
-        for (routeid, nodeord), passes in sorted(stops.items()):
-            passes.sort(key=lambda p: p["ts"])
-            official_min = official.get(routeid)
-            for prev, cur in zip(passes, passes[1:]):
-                gap = (cur["ts"] - prev["ts"]).total_seconds()
-                if gap < MIN_HEADWAY_SEC:
-                    dropped_short += 1
-                    continue
-                if gap > MAX_HEADWAY_SEC:
-                    dropped_long += 1
-                    continue
+            ratio = (gap / 60.0 / official_min) if official_min else None
+            ratio_obs = gap / obs_median if obs_median else None
+            bunching = 1 if (ratio is not None and ratio < BUNCHING_RATIO) else 0
+            bunching_obs = (1 if (ratio_obs is not None
+                                  and ratio_obs < BUNCHING_RATIO) else 0)
 
-                ratio = (gap / 60.0 / official_min) if official_min else ""
-                bunching = 1 if (ratio != "" and ratio < BUNCHING_RATIO) else 0
-                writer.writerow({
-                    "routeid": routeid, "routeno": cur["routeno"],
-                    "nodeord": nodeord, "nodeid": cur["nodeid"],
-                    "nodenm": cur["nodenm"],
-                    "prev_ts": prev["ts"].isoformat(timespec="seconds"),
-                    "pass_ts": cur["ts"].isoformat(timespec="seconds"),
-                    "headway_sec": int(gap),
-                    "date": cur["ts"].date().isoformat(),
-                    "dow": DOW[cur["ts"].weekday()],
-                    "hour": "%02d" % cur["ts"].hour,
-                    "official_min": official_min if official_min else "",
-                    "ratio": "%.3f" % ratio if ratio != "" else "",
-                    "is_bunching": bunching,
-                })
-                written += 1
+            writer.writerow({
+                "routeid": routeid, "routeno": event["routeno"],
+                "nodeord": event["nodeord"], "nodeid": event["nodeid"],
+                "nodenm": event["nodenm"],
+                "prev_ts": event["prev_ts"].isoformat(timespec="seconds"),
+                "pass_ts": event["pass_ts"].isoformat(timespec="seconds"),
+                "headway_sec": int(gap),
+                "date": event["pass_ts"].date().isoformat(),
+                "dow": DOW[event["pass_ts"].weekday()],
+                "hour": "%02d" % event["pass_ts"].hour,
+                "official_min": official_min if official_min else "",
+                "ratio": "%.3f" % ratio if ratio is not None else "",
+                "is_bunching": bunching if ratio is not None else "",
+                "ratio_obs": "%.3f" % ratio_obs if ratio_obs is not None else "",
+                "is_bunching_obs": bunching_obs,
+            })
 
-                summary = by_route.setdefault(routeid, {
-                    "routeid": routeid, "routeno": cur["routeno"],
-                    "official_min": official_min if official_min else "",
-                    "gaps": [], "bunching": 0, "long_wait": 0,
-                })
-                summary["gaps"].append(gap)
-                summary["bunching"] += bunching
-                if ratio != "" and ratio > LONG_WAIT_RATIO:
-                    summary["long_wait"] += 1
+            summary = by_route.setdefault(routeid, {
+                "routeid": routeid, "routeno": event["routeno"],
+                "official_min": official_min if official_min else "",
+                "official_dropped": reason,
+                "gaps": [], "bunching": 0, "bunching_obs": 0, "long_wait": 0,
+            })
+            summary["gaps"].append(gap)
+            summary["bunching"] += bunching
+            summary["bunching_obs"] += bunching_obs
+            if ratio is not None and ratio > LONG_WAIT_RATIO:
+                summary["long_wait"] += 1
 
     rows = []
     for summary in by_route.values():
@@ -173,17 +251,21 @@ def main():
         rows.append({
             "routeid": summary["routeid"], "routeno": summary["routeno"],
             "official_min": official_min,
+            "official_dropped": summary["official_dropped"],
             "n_headway": n,
             "median_min": round(median / 60.0, 1),
             "p90_min": round(percentile(gaps, 0.9) / 60.0, 1),
             "iqr_min": round((q3 - q1) / 60.0, 1),
             "cv": round(var ** 0.5 / mean, 2) if mean else "",
-            "bunching_rate": round(100.0 * summary["bunching"] / n, 1),
-            "long_wait_rate": round(100.0 * summary["long_wait"] / n, 1),
+            "bunching_rate": (round(100.0 * summary["bunching"] / n, 1)
+                              if official_min else ""),
+            "bunching_rate_obs": round(100.0 * summary["bunching_obs"] / n, 1),
+            "long_wait_rate": (round(100.0 * summary["long_wait"] / n, 1)
+                               if official_min else ""),
             "gap_vs_official": (round(median / 60.0 - official_min, 1)
                                 if official_min else ""),
         })
-    rows.sort(key=lambda r: -r["bunching_rate"])
+    rows.sort(key=lambda r: -r["bunching_rate_obs"])
 
     with open(BY_ROUTE_CSV, "w", encoding="utf-8-sig", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=BY_ROUTE_COLUMNS,
@@ -191,25 +273,43 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    print("배차 사건 %d건 / 노선 %d개" % (written, len(rows)))
+    valid = [r for r in rows if r["official_min"] != ""]
+    dropped = [r for r in rows if r["official_min"] == ""]
+
+    print("배차 사건 %d건 / 노선 %d개" % (len(events), len(rows)))
     print("(%d초 미만 %d건, %d시간 초과 %d건 제외)"
-          % (MIN_HEADWAY_SEC, dropped_short, MAX_HEADWAY_SEC // 3600, dropped_long))
+          % (MIN_HEADWAY_SEC, short, MAX_HEADWAY_SEC // 3600, long))
     print()
 
-    with_official = [r for r in rows if r["official_min"] != ""]
-    if with_official:
-        worse = [r for r in with_official if r["gap_vs_official"] > 0]
-        print("공표 배차가 있는 노선 %d개 중 실측 중앙값이 더 긴 노선 %d개 (%.0f%%)"
-              % (len(with_official), len(worse),
-                 100.0 * len(worse) / len(with_official)))
+    if dropped:
+        print("공표 배차를 못 믿어 비운 노선 %d개 — 배차간격이 아닌 값이 들어 있다"
+              % len(dropped))
+        for r in dropped[:8]:
+            print("  %-6s 실측 중앙 %5.1f분   사유: %s"
+                  % (r["routeno"], r["median_min"], r["official_dropped"]))
         print()
-        print("번칭이 잦은 노선 10개")
-        print("  %-6s %6s %8s %8s %8s %7s"
-              % ("노선", "공표", "실측중앙", "P90", "번칭률", "표본"))
-        for r in with_official[:10]:
-            print("  %-6s %5s분 %7.1f분 %7.1f분 %7.1f%% %7d"
+
+    if valid:
+        worse = [r for r in valid if r["gap_vs_official"] > 0]
+        print("공표 배차가 성한 노선 %d개 중 실측 중앙값이 더 긴 노선 %d개 (%.0f%%)"
+              % (len(valid), len(worse), 100.0 * len(worse) / len(valid)))
+        print()
+        print("공표 대비 실측이 나쁜 노선 10개")
+        print("  %-6s %6s %8s %8s %8s %8s %7s"
+              % ("노선", "공표", "실측중앙", "P90", "차이", "번칭률", "표본"))
+        for r in sorted(valid, key=lambda x: -x["gap_vs_official"])[:10]:
+            print("  %-6s %5s분 %7.1f분 %7.1f분 %+7.1f분 %7.1f%% %7d"
                   % (r["routeno"], r["official_min"], r["median_min"],
-                     r["p90_min"], r["bunching_rate"], r["n_headway"]))
+                     r["p90_min"], r["gap_vs_official"], r["bunching_rate"],
+                     r["n_headway"]))
+        print()
+
+    print("실측 중앙값 대비 번칭이 잦은 노선 10개 (공표값과 무관)")
+    print("  %-6s %8s %8s %8s %7s" % ("노선", "실측중앙", "P90", "번칭률", "표본"))
+    for r in rows[:10]:
+        print("  %-6s %7.1f분 %7.1f분 %7.1f%% %7d"
+              % (r["routeno"], r["median_min"], r["p90_min"],
+                 r["bunching_rate_obs"], r["n_headway"]))
     print()
     print("저장: %s" % HEADWAY_CSV)
     print("      %s" % BY_ROUTE_CSV)
