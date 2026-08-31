@@ -53,9 +53,11 @@ COST_PER_BUS_YEAR = 682_945 * 365
 # 민원율의 분모. 10만 통행당 건수로 적으면 자릿수가 읽기 좋다.
 RATE_BASE = 100_000
 
-# 민원은 2025년(온전한 해)을 쓰고, 이용량은 2026-08 일평균을 연간으로 늘려
-# 견준다. 둘 다 노선별 값이라 배율은 순위에 영향을 주지 않는다.
-COMPLAINT_YEAR = 2025
+# 민원은 어느 해를 쓰느냐로 결과가 달라진다. 2025년은 온전한 해라 표본이
+# 두텁지만 실측 배차(2026-08)와 한 해 차이가 난다. 그사이 배차가 조정됐다면
+# 상관이 흐려진다. 2026년은 시점이 가깝지만 8월까지라 표본이 얇다.
+# 둘 다 계산해 견준다. 기본은 시점이 가까운 쪽이다.
+COMPLAINT_YEARS = [2026, 2025]
 
 SUMMARY_COLUMNS = [
     "route_no", "n_headway", "official_min", "median_min", "p90_min",
@@ -117,21 +119,29 @@ def load_headway():
     return out
 
 
-def load_complaints():
+def load_complaints(year):
+    """그 해의 노선별 민원. 자료에 없는 노선은 부르는 쪽에서 0 으로 본다.
+
+    민원이 한 건도 없는 노선을 빼면 안 된다. 0 건은 '자료 없음' 이 아니라
+    '그 해에 신고가 없었다' 는 뜻이고, 서비스가 성했다는 정보다. 그걸
+    버리면 나쁜 노선만 남아 상관이 사라진다.
+    """
     rows = read_csv(COMPLAINTS_CSV)
     if rows is None:
-        return {}
+        return {}, set()
     out = {}
+    covered = set()
     for row in rows:
-        if int(to_float(row.get("year"), 0)) != COMPLAINT_YEAR:
-            continue
         key = norm_route(row.get("route_no"))
+        covered.add(key)
+        if int(to_float(row.get("year"), 0)) != year:
+            continue
         acc = out.setdefault(key, {"total": 0, "failure": 0, "결행": 0, "무정차": 0})
         acc["total"] += int(to_float(row.get("total"), 0))
         acc["failure"] += int(to_float(row.get("service_failure"), 0))
         acc["결행"] += int(to_float(row.get("결행"), 0))
         acc["무정차"] += int(to_float(row.get("무정차"), 0))
-    return out
+    return out, covered
 
 
 def load_ridership():
@@ -207,14 +217,21 @@ def spearman(pairs):
     return (num / den if den else None), n
 
 
-def build_summary(headway, complaints, riders, trips):
+def build_summary(headway, complaints, covered, riders, trips):
     routes = set(headway) | set(complaints) | set(riders)
     rows = []
     for route_no in sorted(routes, key=lambda r: (len(r), r)):
         h = headway.get(route_no, {})
         c = complaints.get(route_no, {})
         daily = riders.get(route_no)
-        failure = c.get("failure")
+        # 민원 자료가 덮는 노선인데 그 해 기록이 없으면 0 건이다.
+        if c:
+            failure = c.get("failure")
+        elif route_no in covered:
+            c = {"total": 0, "failure": 0, "결행": 0, "무정차": 0}
+            failure = 0
+        else:
+            failure = None
 
         # 사람이 많이 타는 노선일수록 민원도 많다. 이용량으로 나눠야
         # 노선끼리 견줄 수 있다.
@@ -284,7 +301,30 @@ def build_priority(rows):
     return out
 
 
-def report(rows, priority, ridership_file):
+def layer1(rows, label):
+    """민원이 실제 배차 불안정을 반영하는지 순위상관으로 본다."""
+    deep = [r for r in rows if r["has_headway"] and r["failure_per_100k"] is not None]
+    checks = [
+        ("실측 배차 중앙값", "median_min"),
+        ("P90 배차", "p90_min"),
+        ("공표 대비 초과", "gap_vs_official"),
+        ("번칭률", "bunching_rate_obs"),
+    ]
+    print("  [%s]  겹치는 노선 %d개" % (label, len(deep)))
+    best = 0.0
+    for name, field in checks:
+        rho, n = spearman([(r["failure_per_100k"], r[field]) for r in deep])
+        if rho is None:
+            print("    %-16s 표본 부족 (%d개)" % (name, n))
+            continue
+        strength = ("뚜렷" if abs(rho) >= 0.5 else
+                    "약함" if abs(rho) >= 0.3 else "없음")
+        print("    %-16s rho %+.2f  (n=%d, %s)" % (name, rho, n, strength))
+        best = max(best, abs(rho))
+    return len(deep), best
+
+
+def report(rows, priority, ridership_file, alt_rows):
     deep = [r for r in rows if r["has_headway"] and r["failure_per_100k"] is not None]
     wide = [r for r in rows if r["failure_per_100k"] is not None]
 
@@ -295,26 +335,21 @@ def report(rows, priority, ridership_file):
     print()
 
     print("=" * 62)
-    print("1층 — 민원이 실제 배차 불안정을 반영하는가 (겹치는 %d개 노선)" % len(deep))
+    print("1층 — 민원이 실제 배차 불안정을 반영하는가")
     print("=" * 62)
-    checks = [
-        ("민원율 ↔ 실측 배차 중앙값", "median_min"),
-        ("민원율 ↔ P90 배차", "p90_min"),
-        ("민원율 ↔ 공표 대비 초과", "gap_vs_official"),
-        ("민원율 ↔ 번칭률", "bunching_rate_obs"),
-    ]
-    for label, field in checks:
-        rho, n = spearman([(r["failure_per_100k"], r[field]) for r in deep])
-        if rho is None:
-            print("  %-26s 표본 부족 (%d개)" % (label, n))
-        else:
-            strength = ("뚜렷" if abs(rho) >= 0.5 else
-                        "약함" if abs(rho) >= 0.3 else "없음")
-            print("  %-26s rho %+.2f  (n=%d, %s)" % (label, rho, n, strength))
+    n_main, best_main = layer1(rows, "민원 %d년" % COMPLAINT_YEARS[0])
     print()
-    print("  rho 가 양수면 민원이 많은 노선일수록 배차가 실제로 나쁘다는 뜻이다.")
-    print("  뚜렷하게 나오면 민원을 대리지표 삼아 전 노선으로 넓힐 수 있다.")
+    n_alt, best_alt = layer1(alt_rows, "민원 %d년" % COMPLAINT_YEARS[1])
     print()
+    print("  양수면 민원이 많은 노선일수록 배차가 실제로 나쁘다는 뜻이다.")
+    print("  실측 배차는 2026-08 관측이라, 민원도 가까운 해를 쓰는 쪽이 맞다.")
+    print("  두 해가 크게 다르면 그사이 배차가 조정됐다는 뜻이다.")
+    print()
+    if max(best_main, best_alt) < 0.3:
+        print("  >> 어느 쪽도 뚜렷하지 않다. 민원을 배차 불안정의 대리지표로")
+        print("     쓸 수 없다는 뜻이므로, 2층은 '민원 자체의 분포' 로만 읽고")
+        print("     결론은 실측이 있는 노선으로 한정해야 한다.")
+        print()
 
     print("=" * 62)
     print("2층 — 서비스 불안정 노선 (전체 %d개, 이용 10만 통행당 결행·무정차)" % len(wide))
@@ -354,7 +389,8 @@ def report(rows, priority, ridership_file):
 
 def main():
     headway = load_headway()
-    complaints = load_complaints()
+    complaints, covered = load_complaints(COMPLAINT_YEARS[0])
+    alt_complaints, _ = load_complaints(COMPLAINT_YEARS[1])
     riders, ridership_file = load_ridership()
     trips = load_trip_minutes()
 
@@ -371,7 +407,8 @@ def main():
             print("  - %s" % item)
         return 1
 
-    rows = build_summary(headway, complaints, riders, trips)
+    rows = build_summary(headway, complaints, covered, riders, trips)
+    alt_rows = build_summary(headway, alt_complaints, covered, riders, trips)
     priority = build_priority(rows)
 
     os.makedirs(PROC_DIR, exist_ok=True)
@@ -386,7 +423,7 @@ def main():
         writer.writeheader()
         writer.writerows(priority)
 
-    report(rows, priority, ridership_file)
+    report(rows, priority, ridership_file, alt_rows)
     print()
     print("저장: %s" % SUMMARY_CSV)
     print("      %s" % PRIORITY_CSV)
