@@ -49,6 +49,7 @@ TOP_N = 12              # 한 그림에 담을 노선 수
 BAR = 11                # 막대 두께
 GROUP_GAP = 8           # 노선 사이 여백
 PAD_L, PAD_R, PAD_T, PAD_B = 92, 108, 64, 48
+PAD_R_WIDE = 176   # 오른쪽 주석이 긴 그림용
 
 
 def esc(text):
@@ -238,41 +239,53 @@ def fig_p90(rows, path):
 
 
 def fig_priority(rows, path):
-    """계열이 하나라 범례를 두지 않는다. 제목이 무엇인지 말한다."""
-    data = rows[:TOP_N]
+    """계열이 하나라 범례를 두지 않는다. 제목이 무엇인지 말한다.
+
+    '하루 857시간' 같은 총량은 규모는 크지만 아무도 체감하지 못한다. 매일
+    타는 사람 한 명이 한 해에 며칠을 더 쓰는지로 바꾸면 곧바로 와닿는다.
+    비용도 총액 대신 그 노선을 타는 사람 한 명당으로 적는다 — 정기권 한 달
+    값과 견줄 수 있는 자릿수라야 판단이 선다.
+    """
+    data = [r for r in rows if num(r.get("yearly_days_per_rider"))]
+    data.sort(key=lambda r: -num(r["yearly_days_per_rider"], 0))
+    data = data[:TOP_N]
     if not data:
         return None
 
     row_h = 24
     plot_h = row_h * len(data)
-    width, height = 760, PAD_T + plot_h + PAD_B - 16
-    ticks, upper = nice_ticks(max(num(r["hours_saved_per_100m"], 0) for r in data))
-    plot_w = width - PAD_L - PAD_R
+    width, height = 820, PAD_T + plot_h + PAD_B - 16
+    ticks, upper = nice_ticks(max(num(r["yearly_days_per_rider"], 0) for r in data))
+    plot_w = width - PAD_L - PAD_R_WIDE
 
-    parts = svg_open(width, height, "증차 1억원당 시민에게 돌려주는 시간")
-    parts.append('<text class="t" x="%d" y="26">어느 노선부터 손대야 하는가</text>'
-                 % PAD_L)
-    parts.append('<text class="s" x="%d" y="46">버스를 늘려 공표 배차까지 '
-                 '되돌릴 때, 1억원당 하루에 줄어드는 대기시간</text>' % PAD_L)
-    axis(parts, ticks, upper, PAD_L, plot_w, PAD_T, plot_h, "시간")
+    parts = svg_open(width, height, "매일 타는 사람이 한 해에 더 쓰는 시간")
+    parts.append('<text class="t" x="%d" y="26">매일 이 버스를 타면, '
+                 '1년에 이만큼을 정류장에서 더 쓴다</text>' % PAD_L)
+    parts.append('<text class="s" x="%d" y="46">공표 배차대로 왔다면 안 기다려도 '
+                 '됐을 시간 (왕복 두 번 × 연 250일)</text>' % PAD_L)
+    axis(parts, ticks, upper, PAD_L, plot_w, PAD_T, plot_h, "일")
 
     for i, row in enumerate(data):
         y = PAD_T + i * row_h + 3
-        value = num(row["hours_saved_per_100m"], 0)
+        value = num(row["yearly_days_per_rider"], 0)
+        hours = num(row["yearly_hours_per_rider"], 0)
+        per_rider = num(row["cost_per_rider_won"], 0)
         w = plot_w * value / upper
         parts.append('<text class="l" x="%d" y="%.1f" text-anchor="end">%s번</text>'
                      % (PAD_L - 12, y + BAR / 2, esc(row["route_no"])))
         parts.append('<rect x="%d" y="%.1f" width="%.1f" height="%d" rx="4" '
-                     'fill="%s"><title>%s번 — 하루 %s시간 절감, 버스 %s대, '
-                     '연 %.1f억원</title></rect>'
+                     'fill="%s"><title>%s번 — 한 해 %.0f시간(%.1f일), '
+                     '버스 %s대 연 %.1f억원</title></rect>'
                      % (PAD_L, y, max(w, 2), BAR + 2, ACTUAL,
-                        esc(row["route_no"]), row["daily_lost_hours"],
+                        esc(row["route_no"]), hours, value,
                         row["buses_needed"],
                         num(row["annual_cost_won"], 0) / 1e8))
-        parts.append('<text class="v" x="%.1f" y="%.1f">%.0f시간</text>'
+        parts.append('<text class="v" x="%.1f" y="%.1f">%.1f일</text>'
                      % (PAD_L + w + 9, y + BAR / 2, value))
-        parts.append('<text class="a" x="%d" y="%.1f" text-anchor="end">버스 %s대'
-                     '</text>' % (width - 8, y + BAR / 2, row["buses_needed"]))
+        parts.append('<text class="a" x="%d" y="%.1f" text-anchor="end">'
+                     '고치는 데 1인당 연 %s원</text>'
+                     % (width - 8, y + BAR / 2,
+                        "{:,.0f}".format(per_rider) if per_rider else "-"))
 
     parts.append("</svg>")
     with open(path, "w", encoding="utf-8") as f:

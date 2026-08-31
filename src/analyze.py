@@ -53,6 +53,14 @@ COST_PER_BUS_YEAR = 682_945 * 365
 # 민원율의 분모. 10만 통행당 건수로 적으면 자릿수가 읽기 좋다.
 RATE_BASE = 100_000
 
+# '하루 857시간' 같은 총량은 규모는 크지만 아무도 체감하지 못한다. 매일 타는
+# 사람 한 명이 1년에 얼마를 더 쓰는지로 바꾸면 곧바로 와닿는다.
+# 통근자는 하루 왕복 두 번 타고, 주말·휴가를 빼면 한 해 250일쯤 탄다.
+# 이용량은 통행 건수라, 왕복 두 건을 한 사람으로 환산한다.
+TRIPS_PER_DAY = 2
+COMMUTE_DAYS = 250
+TRIPS_PER_PERSON = 2
+
 # 민원은 어느 해를 쓰느냐로 결과가 달라진다. 2025년은 온전한 해라 표본이
 # 두텁지만 실측 배차(2026-08)와 한 해 차이가 난다. 그사이 배차가 조정됐다면
 # 상관이 흐려진다. 2026년은 시점이 가깝지만 8월까지라 표본이 얇다.
@@ -67,8 +75,9 @@ SUMMARY_COLUMNS = [
 ]
 PRIORITY_COLUMNS = [
     "route_no", "daily_riders", "official_min", "median_min",
-    "excess_wait_min", "daily_lost_hours", "buses_needed",
-    "annual_cost_won", "hours_saved_per_100m", "priority_rank",
+    "excess_wait_min", "yearly_hours_per_rider", "yearly_days_per_rider",
+    "daily_lost_hours", "buses_needed", "annual_cost_won",
+    "cost_per_rider_won", "hours_saved_per_100m", "priority_rank",
 ]
 
 PAREN_RE = re.compile(r"\((상|하|[0-9]+)\)\s*$")
@@ -283,16 +292,23 @@ def build_priority(rows):
         if buses <= 0:
             continue
         cost = buses * COST_PER_BUS_YEAR
+        # 매일 타는 사람 한 명이 한 해에 더 쓰는 시간
+        yearly_min = excess_wait * TRIPS_PER_DAY * COMMUTE_DAYS
+        riders = daily / TRIPS_PER_PERSON
         out.append({
             "route_no": row["route_no"],
             "daily_riders": daily,
             "official_min": official,
             "median_min": median,
             "excess_wait_min": round(excess_wait, 1),
+            "yearly_hours_per_rider": round(yearly_min / 60.0, 1),
+            "yearly_days_per_rider": round(yearly_min / 60.0 / 24.0, 1),
             "daily_lost_hours": round(lost_hours, 1),
             "buses_needed": round(buses, 1),
             "annual_cost_won": int(cost),
-            # 1억원을 들여 하루에 몇 시간을 돌려주는가
+            # 그 노선을 타는 사람 한 명당 한 해 얼마를 쓰는 셈인가
+            "cost_per_rider_won": int(cost / riders) if riders else "",
+            # 1억원을 들여 하루에 몇 시간을 돌려주는가 (정책 판단용)
             "hours_saved_per_100m": round(lost_hours / (cost / 1e8), 1),
         })
     out.sort(key=lambda r: -r["hours_saved_per_100m"])
@@ -369,15 +385,19 @@ def report(rows, priority, ridership_file, alt_rows):
         return
 
     print("=" * 62)
-    print("3층 — 개선 우선순위 (증차 1억원당 하루에 돌려주는 시간)")
+    print("3층 — 개선 우선순위")
     print("=" * 62)
-    print("  %-6s %9s %7s %7s %9s %7s %9s"
-          % ("노선", "일이용객", "공표", "실측", "손실시간", "증차", "억원당"))
-    for r in priority[:12]:
-        print("  %-6s %9s %6.0f분 %6.1f분 %8.0fh %6.1f대 %8.1fh"
-              % (r["route_no"], "{:,}".format(r["daily_riders"]),
-                 r["official_min"], r["median_min"], r["daily_lost_hours"],
-                 r["buses_needed"], r["hours_saved_per_100m"]))
+    print("  매일 타는 사람 한 명이 한 해에 정류장에서 더 쓰는 시간")
+    print("  (왕복 두 번 × %d일 기준)" % COMMUTE_DAYS)
+    print()
+    print("  %-6s %7s %7s %9s %8s %8s %11s"
+          % ("노선", "공표", "실측", "1년에", "증차", "연비용", "1인당 연비용"))
+    for r in sorted(priority, key=lambda x: -x["yearly_days_per_rider"])[:12]:
+        print("  %-6s %6.0f분 %6.1f분 %8.1f일 %7.1f대 %7.2f억 %10s원"
+              % (r["route_no"], r["official_min"], r["median_min"],
+                 r["yearly_days_per_rider"], r["buses_needed"],
+                 r["annual_cost_won"] / 1e8,
+                 "{:,}".format(r["cost_per_rider_won"])))
     print()
     total_hours = sum(r["daily_lost_hours"] for r in priority)
     total_cost = sum(r["annual_cost_won"] for r in priority)
