@@ -120,8 +120,13 @@ def load_headway():
         out[key] = {
             "n_headway": n,
             "official_min": to_float(row.get("official_min")),
-            "median_min": to_float(row.get("median_min")),
-            "p90_min": to_float(row.get("p90_min")),
+            # 심야가 섞인 전 시간대 값 대신 평시(07~21시) 값을 쓴다.
+            # 첫차 전후와 막차 무렵의 긴 간격은 정상 운영이라 문제로
+            # 세면 과장이 된다. 평시 열이 없는 옛 CSV 는 종전대로 읽는다.
+            "median_min": (to_float(row.get("median_day_min"))
+                           or to_float(row.get("median_min"))),
+            "p90_min": (to_float(row.get("p90_day_min"))
+                        or to_float(row.get("p90_min"))),
             "gap_vs_official": to_float(row.get("gap_vs_official")),
             "bunching_rate_obs": to_float(row.get("bunching_rate_obs")),
         }

@@ -64,6 +64,15 @@ def read_csv(path):
         return list(csv.DictReader(f))
 
 
+def day_value(row, name):
+    """평시(07~21시) 값이 있으면 그것을, 없으면 전 시간대 값을 쓴다.
+
+    심야의 긴 간격을 최악값으로 세면 과장이다. build_headway.py 가
+    median_day_min / p90_day_min 을 내므로 그쪽을 먼저 본다.
+    """
+    return num(row.get(name + "_day_min")) or num(row.get(name + "_min"))
+
+
 def by_route(rows, key="routeno"):
     """같은 노선번호를 한 줄로 합친다.
 
@@ -154,7 +163,7 @@ def legend(parts, x, y, items):
 def fig_headway_gap(rows, path):
     """공표와 실측을 나란히 놓는다. 계열이 둘이라 범례와 직접 라벨을 함께 단다."""
     data = [r for r in by_route(rows)
-            if num(r.get("official_min")) and num(r.get("median_min"))
+            if num(r.get("official_min")) and day_value(r, "median")
             and num(r.get("gap_vs_official"), 0) > 0]
     data.sort(key=lambda r: -num(r["gap_vs_official"], 0))
     data = data[:TOP_N]
@@ -164,7 +173,7 @@ def fig_headway_gap(rows, path):
     row_h = BAR * 2 + GROUP_GAP
     plot_h = row_h * len(data)
     width, height = 760, PAD_T + plot_h + PAD_B
-    top = max(num(r["median_min"]) for r in data)
+    top = max(day_value(r, "median") for r in data)
     ticks, upper = nice_ticks(top)
     plot_w = width - PAD_L - PAD_R
 
@@ -178,7 +187,7 @@ def fig_headway_gap(rows, path):
 
     for i, row in enumerate(data):
         y = PAD_T + i * row_h + GROUP_GAP / 2
-        official, actual = num(row["official_min"]), num(row["median_min"])
+        official, actual = num(row["official_min"]), day_value(row, "median")
         parts.append('<text class="l" x="%d" y="%.1f" text-anchor="end">%s번</text>'
                      % (PAD_L - 12, y + BAR, esc(row["routeno"])))
         for value, color, name, offset in ((official, OFFICIAL, "공표", 0),
@@ -208,9 +217,9 @@ def fig_p90(rows, path):
     따로 세우는 것보다 사이를 이어 보이는 편이 낫다.
     """
     data = [r for r in by_route(rows)
-            if num(r.get("median_min")) and num(r.get("p90_min"))
+            if day_value(r, "median") and day_value(r, "p90")
             and num(r.get("n_headway"), 0) >= 100]
-    data.sort(key=lambda r: -num(r["p90_min"], 0))
+    data.sort(key=lambda r: -(day_value(r, "p90") or 0))
     data = data[:TOP_N]
     if not data:
         return None
@@ -218,7 +227,7 @@ def fig_p90(rows, path):
     row_h = 26
     plot_h = row_h * len(data)
     width, height = 760, PAD_T + plot_h + PAD_B
-    ticks, upper = nice_ticks(max(num(r["p90_min"]) for r in data))
+    ticks, upper = nice_ticks(max(day_value(r, "p90") for r in data))
     plot_w = width - PAD_L - PAD_R
 
     parts = svg_open(width, height, "노선별 평상시 배차와 최악 배차")
@@ -232,7 +241,7 @@ def fig_p90(rows, path):
 
     for i, row in enumerate(data):
         y = PAD_T + i * row_h + row_h / 2
-        median, p90 = num(row["median_min"]), num(row["p90_min"])
+        median, p90 = day_value(row, "median"), day_value(row, "p90")
         x1 = PAD_L + plot_w * median / upper
         x2 = PAD_L + plot_w * p90 / upper
         parts.append('<text class="l" x="%d" y="%.1f" text-anchor="end">%s번</text>'
