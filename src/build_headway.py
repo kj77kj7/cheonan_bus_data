@@ -51,6 +51,8 @@ HEADWAY_COLUMNS = ["routeid", "routeno", "nodeord", "nodeid", "nodenm",
                    "ratio_obs", "is_bunching_obs", "missed_between"]
 BY_ROUTE_COLUMNS = ["routeid", "routeno", "official_min", "official_dropped",
                     "n_headway", "n_excluded", "median_min", "p90_min",
+                    "n_day", "median_day_min", "p90_day_min",
+                    "n_peak", "median_peak_min", "p90_peak_min",
                     "iqr_min", "cv",
                     "bunching_rate", "bunching_rate_obs", "long_wait_rate",
                     "gap_vs_official"]
@@ -79,6 +81,13 @@ MAX_OFFICIAL_SHARE = 1.0 / 3
 # 첫차·막차를 모르는 노선에 쓸 절대 상한(분).
 MAX_OFFICIAL_MIN = 180
 
+# 시간대를 안 가리고 P90 을 내면 첫차 전후와 막차 무렵의 긴 간격이 그대로
+# 섞인다. 심야에 40분이 뜨는 것은 정상 운영이지 문제가 아닌데, 그것이
+# "열 번에 한 번은 168분"으로 읽히면 과장이다. 시민이 실제로 버스를 쓰는
+# 시간대만 따로 잰 값을 나란히 낸다.
+DAY_START, DAY_END = 7, 21        # 평시 07:00~20:59
+PEAK_HOURS = {7, 8, 17, 18}       # 출퇴근 첨두
+
 DOW = ["월", "화", "수", "목", "금", "토", "일"]
 
 
@@ -87,6 +96,11 @@ def percentile(values, q):
     if not values:
         return None
     return values[int(round(q * (len(values) - 1)))]
+
+
+def mins(seconds):
+    """초를 분으로. 표본이 비면 빈칸."""
+    return round(seconds / 60.0, 1) if seconds is not None else ""
 
 
 def to_minutes(text):
@@ -293,13 +307,21 @@ def main():
                 "routeid": routeid, "routeno": event["routeno"],
                 "official_min": official_min if official_min else "",
                 "official_dropped": reason,
-                "gaps": [], "bunching": 0, "bunching_obs": 0, "long_wait": 0,
+                "gaps": [], "gaps_day": [], "gaps_peak": [],
+                "bunching": 0, "bunching_obs": 0, "long_wait": 0,
                 "excluded": 0,
             })
             if EXCLUDE_MISSED and event["missed"]:
                 summary["excluded"] += 1
                 continue
             summary["gaps"].append(gap)
+            # 시간대는 뒤 차의 통과 시각으로 매긴다. 앞 차 기준으로 하면
+            # 막차 직전에 시작해 다음 날 첫차로 끝나는 간격이 평시로 샌다.
+            hour = event["pass_ts"].hour
+            if DAY_START <= hour < DAY_END:
+                summary["gaps_day"].append(gap)
+            if hour in PEAK_HOURS:
+                summary["gaps_peak"].append(gap)
             summary["bunching"] += bunching
             summary["bunching_obs"] += bunching_obs
             if ratio is not None and ratio > LONG_WAIT_RATIO:
@@ -308,6 +330,8 @@ def main():
     rows = []
     for summary in by_route.values():
         gaps = sorted(summary["gaps"])
+        day = sorted(summary["gaps_day"])
+        peak = sorted(summary["gaps_peak"])
         n = len(gaps)
         if not n:
             continue
@@ -324,6 +348,12 @@ def main():
             "n_excluded": summary["excluded"],
             "median_min": round(median / 60.0, 1),
             "p90_min": round(percentile(gaps, 0.9) / 60.0, 1),
+            "n_day": len(day),
+            "median_day_min": mins(percentile(day, 0.5)),
+            "p90_day_min": mins(percentile(day, 0.9)),
+            "n_peak": len(peak),
+            "median_peak_min": mins(percentile(peak, 0.5)),
+            "p90_peak_min": mins(percentile(peak, 0.9)),
             "iqr_min": round((q3 - q1) / 60.0, 1),
             "cv": round(var ** 0.5 / mean, 2) if mean else "",
             "bunching_rate": (round(100.0 * summary["bunching"] / n, 1)
