@@ -58,7 +58,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BY_ROUTE_CSV = os.path.join(DATA_DIR, "processed", "headway_by_route.csv")
 EVENTS_CSV = os.path.join(DATA_DIR, "interim", "stop_events.csv")
-RIDERSHIP_CSV = os.path.join(DATA_DIR, "raw", "route_ridership.csv")
+RIDERSHIP_DIR = os.path.join(DATA_DIR, "ridership")
 STOPS_CSV = os.path.join(DATA_DIR, "route_stops.csv")
 OUT_CSV = os.path.join(DATA_DIR, "processed", "scenarios.csv")
 
@@ -110,51 +110,89 @@ def read_csv(path):
 # ── 자료 적재 ──────────────────────────────────────────────────────────
 
 def load_trip_minutes():
-    """노선별 한 운행 소요시간 T(분)의 중앙값.
+    """노선별 한 운행 소요시간 T(분)의 중앙값. **관측 구간을 전 구간으로 편다.**
 
-    N = T/h 의 T 다. 관측에서 직접 잰다. 한 운행(trip_key)의 첫 통과와
-    마지막 통과 사이가 그 운행의 소요시간이다.
+    N = T/h 의 T 다. 그냥 한 운행의 첫 통과와 마지막 통과 사이를 재면
+    T 가 짧게 나온다. 60초 주기라 한 운행의 정류장을 다 못 보고, 특히
+    출발 직후와 종점 직전이 자주 빠지기 때문이다. 실제로 910번이 64분
+    1.03대로 나왔는데, 그 노선 길이에 비해 말이 안 되는 값이다.
+
+    T 가 짧으면 현재 대수 N=T/h 도 작게 잡히고, 목표 배차에 필요한 증차
+    대수와 비용이 통째로 과소평가된다. 정책 제안에서 비용을 낮춰 부르는
+    쪽으로 틀리는 것이라 그냥 두면 안 된다.
+
+    그래서 nodeord 로 편다. 어떤 운행에서 nodeord 5번부터 50번까지를
+    봤고 그 노선 정류장이 62개라면, 실제 운행은 1~62 를 도는 것이므로
+        T = 관측시간 × (62-1) / (50-5)
+    로 늘린다. 정류장 간 소요가 고르다는 가정이고, 보통 종점 부근이 더
+    빠르므로 약간 과대추정 쪽이다. 비용을 낮춰 부르는 것보다 낫다.
     """
     rows = read_csv(EVENTS_CSV)
     if not rows:
         return {}
-    spans = {}
+
+    # 노선별 최대 nodeord = 그 노선의 전 구간 길이
+    span_of_route = {}
+    trips = {}
     for row in rows:
         try:
             ts = datetime.fromisoformat(row["pass_ts"])
+            ordv = int(row["nodeord"])
         except (KeyError, ValueError, TypeError):
             continue
-        key = (norm_route(row.get("routeno")), row.get("trip_key"))
-        first, last = spans.get(key, (ts, ts))
-        spans[key] = (min(first, ts), max(last, ts))
+        route = norm_route(row.get("routeno"))
+        span_of_route[route] = max(span_of_route.get(route, 0), ordv)
+        key = (route, row.get("trip_key"))
+        rec = trips.get(key)
+        if rec is None:
+            trips[key] = [ts, ts, ordv, ordv]
+        else:
+            if ts < rec[0]:
+                rec[0] = ts
+            if ts > rec[1]:
+                rec[1] = ts
+            rec[2] = min(rec[2], ordv)
+            rec[3] = max(rec[3], ordv)
 
     by_route = {}
-    for (route_no, _), (first, last) in spans.items():
-        minutes = (last - first).total_seconds() / 60.0
+    for (route, _), (first, last, lo, hi) in trips.items():
+        observed = (last - first).total_seconds() / 60.0
+        seen = hi - lo
+        full = span_of_route.get(route, 0) - 1
+        if observed <= 0 or seen <= 0 or full <= 0:
+            continue
+        # 관측 구간이 노선의 3할도 안 되면 외삽이 너무 거칠어 버린다.
+        if seen / float(full) < 0.30:
+            continue
+        minutes = observed * full / seen
         if 5 <= minutes <= 240:            # 한 바퀴로 보기 어려운 것은 뺀다
-            by_route.setdefault(route_no, []).append(minutes)
+            by_route.setdefault(route, []).append(minutes)
     return {k: sorted(v)[len(v) // 2] for k, v in by_route.items() if v}
 
 
 def load_ridership():
-    """노선별 하루 이용량(통행). STCIS 노선별 이용량에서 온다."""
-    rows = read_csv(RIDERSHIP_CSV)
-    if not rows:
+    """노선별 일평균 이용량(통행). analyze.py 와 같은 자리, 같은 방식으로 읽는다.
+
+    STCIS 수집기(fetch_route_ridership.py)가 data/ridership/route_<기간>.csv
+    로 떨군다. 기간 파일이 여럿이면 가장 최근 것을 쓴다. 열은 use_cnt 다.
+    """
+    if not os.path.isdir(RIDERSHIP_DIR):
         return {}
-    total, days = {}, {}
-    for row in rows:
-        route = norm_route(row.get("route_no") or row.get("노선명")
-                           or row.get("routeno"))
-        value = None
-        for key in ("riders", "이용건수", "승차인원", "total", "value"):
-            value = num(row.get(key))
-            if value is not None:
-                break
-        if not route or value is None:
-            continue
-        total[route] = total.get(route, 0.0) + value
-        days.setdefault(route, set()).add(row.get("date") or row.get("일자"))
-    return {r: total[r] / max(len(days[r]), 1) for r in total}
+    files = sorted(f for f in os.listdir(RIDERSHIP_DIR)
+                   if f.startswith("route_") and f.endswith(".csv"))
+    if not files:
+        return {}
+    totals, dates = {}, set()
+    with open(os.path.join(RIDERSHIP_DIR, files[-1]), encoding="utf-8-sig",
+              newline="") as f:
+        for row in csv.DictReader(f):
+            route = norm_route(row.get("route_no"))
+            if not route:
+                continue
+            totals[route] = totals.get(route, 0.0) + (num(row.get("use_cnt"), 0) or 0)
+            dates.add(row.get("date"))
+    days = max(1, len(dates))
+    return {k: v / days for k, v in totals.items()}
 
 
 def load_stop_counts():

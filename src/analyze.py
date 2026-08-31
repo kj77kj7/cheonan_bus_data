@@ -180,26 +180,15 @@ def load_ridership():
 
 
 def load_trip_minutes():
-    """노선별 한 운행의 소요시간 중앙값(분). 증차 대수 계산에 쓴다."""
-    rows = read_csv(EVENTS_CSV)
-    if rows is None:
-        return {}
-    spans = {}
-    for row in rows:
-        try:
-            ts = datetime.fromisoformat(row["pass_ts"])
-        except (KeyError, ValueError):
-            continue
-        key = (norm_route(row.get("routeno")), row.get("trip_key"))
-        first, last = spans.get(key, (ts, ts))
-        spans[key] = (min(first, ts), max(last, ts))
+    """노선별 한 운행의 소요시간 중앙값(분). 증차 대수 계산에 쓴다.
 
-    by_route = {}
-    for (route_no, _), (first, last) in spans.items():
-        minutes = (last - first).total_seconds() / 60.0
-        if 5 <= minutes <= 240:          # 한 바퀴로 보기 어려운 것은 뺀다
-            by_route.setdefault(route_no, []).append(minutes)
-    return {k: sorted(v)[len(v) // 2] for k, v in by_route.items() if v}
+    simulate.py 와 같은 값을 써야 한다. 그냥 관측 첫 통과~마지막 통과를
+    재면 60초 주기가 못 본 앞뒤가 잘려 T 가 짧게 나오고, 그만큼 필요한
+    증차 대수와 비용이 낮게 잡힌다. nodeord 로 전 구간까지 펴는 보정이
+    simulate 쪽에 있으므로 그것을 그대로 가져다 쓴다.
+    """
+    from simulate import load_trip_minutes as _load
+    return _load()
 
 
 def spearman(pairs):
