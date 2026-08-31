@@ -28,10 +28,11 @@
     python src/build_headway.py
 """
 
+import bisect
 import csv
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config import DATA_DIR
 
@@ -47,9 +48,10 @@ BY_ROUTE_CSV = os.path.join(OUT_DIR, "headway_by_route.csv")
 HEADWAY_COLUMNS = ["routeid", "routeno", "nodeord", "nodeid", "nodenm",
                    "prev_ts", "pass_ts", "headway_sec", "date", "dow", "hour",
                    "official_min", "ratio", "is_bunching",
-                   "ratio_obs", "is_bunching_obs"]
+                   "ratio_obs", "is_bunching_obs", "missed_between"]
 BY_ROUTE_COLUMNS = ["routeid", "routeno", "official_min", "official_dropped",
-                    "n_headway", "median_min", "p90_min", "iqr_min", "cv",
+                    "n_headway", "n_excluded", "median_min", "p90_min",
+                    "iqr_min", "cv",
                     "bunching_rate", "bunching_rate_obs", "long_wait_rate",
                     "gap_vs_official"]
 
@@ -59,6 +61,16 @@ MIN_HEADWAY_SEC = 60
 MAX_HEADWAY_SEC = 3 * 3600
 
 BUNCHING_RATIO = 0.30      # 이 비율 미만이면 붙어 온 것으로 본다
+
+# 어떤 운행이 정류장을 통째로 놓치면 그 정류장의 배차 계열에서 그 운행이
+# 빠져, 앞뒤 간격이 실제의 두 배로 잡힌다. 놓친 운행은 사건 자체가 없어
+# gap_before 로는 안 잡히지만, 그 운행이 앞뒤 정류장은 관측했으므로 통과
+# 시각을 보간해 복원할 수 있다. 그 시각이 두 배차 사이에 끼면 오염이다.
+EXCLUDE_MISSED = True
+
+# 표본이 두 자릿수인 노선은 순위에 올리지 않는다. 18건짜리 노선이 번칭률
+# 1위로 올라오면 표가 오해를 부른다.
+MIN_SAMPLE_FOR_RANK = 100
 LONG_WAIT_RATIO = 2.0      # 공표값의 2배를 넘으면 하염없이 기다린 것
 
 # 공표 배차가 운행시간대의 1/3 을 넘으면 하루 세 번도 안 다닌다는 뜻이다.
@@ -122,35 +134,77 @@ def load_official():
 
 
 def load_events():
-    """정류장별로 통과 사건을 모은다. 운행마다 한 번씩만 센다."""
-    stops = {}
-    seen = set()
+    """정류장별 통과 사건과, 그 정류장을 놓친 운행의 보간 통과시각을 모은다.
+
+    돌려주는 것은 (stops, missed).
+      stops  {(routeid, nodeord): [통과 사건]}
+      missed {(routeid, nodeord): [정렬된 보간 시각]}
+
+    어떤 운행이 nodeord 5 를 보고 7 을 봤다면 6 은 놓친 것이다. 5 와 7 의
+    관측 시각을 순번으로 나눠 6 의 통과 시각을 추정한다. 정류장 간격이
+    고르다는 가정이라 정확하진 않지만, 그 시각이 두 배차 사이에 드는지만
+    보면 되므로 이 정도로 충분하다.
+    """
+    trips = {}
     with open(EVENTS_CSV, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             try:
                 ts = datetime.fromisoformat(row["pass_ts"])
                 nodeord = int(row["nodeord"])
+                gap_before = int(row.get("gap_before") or 0)
             except (KeyError, ValueError):
                 continue
-            # 한 운행이 같은 정류장을 두 번 지나면(순환노선) 앞의 것만 쓴다.
-            trip_stop = (row["trip_key"], nodeord)
-            if trip_stop in seen:
-                continue
-            seen.add(trip_stop)
-            stops.setdefault((row["routeid"], nodeord), []).append({
-                "ts": ts, "routeno": row["routeno"],
+            trips.setdefault(row["trip_key"], []).append({
+                "ts": ts, "nodeord": nodeord, "gap_before": gap_before,
+                "routeid": row["routeid"], "routeno": row["routeno"],
                 "nodeid": row["nodeid"], "nodenm": row["nodenm"],
             })
-    return stops
+
+    stops = {}
+    missed = {}
+    for events in trips.values():
+        events.sort(key=lambda e: e["nodeord"])
+        seen = set()
+        for event in events:
+            # 한 운행이 같은 정류장을 두 번 지나면(순환노선) 앞의 것만 쓴다.
+            if event["nodeord"] in seen:
+                continue
+            seen.add(event["nodeord"])
+            stops.setdefault((event["routeid"], event["nodeord"]), []).append(event)
+
+        for prev, cur in zip(events, events[1:]):
+            if cur["gap_before"] <= 0:
+                continue
+            span_ord = cur["nodeord"] - prev["nodeord"]
+            span_sec = (cur["ts"] - prev["ts"]).total_seconds()
+            if span_ord <= 1:
+                continue
+            for missing in range(prev["nodeord"] + 1, cur["nodeord"]):
+                share = (missing - prev["nodeord"]) / float(span_ord)
+                when = prev["ts"] + timedelta(seconds=span_sec * share)
+                missed.setdefault((cur["routeid"], missing), []).append(when)
+
+    for key in missed:
+        missed[key].sort()
+    return stops, missed
 
 
-def collect_headways(stops):
+def has_missed_between(times, start, end):
+    """start 와 end 사이에 놓친 운행의 통과 시각이 있는가."""
+    if not times:
+        return False
+    index = bisect.bisect_right(times, start)
+    return index < len(times) and times[index] < end
+
+
+def collect_headways(stops, missed):
     """배차 사건을 모은다. 노선별 실측 중앙값을 알아야 번칭을 매길 수 있어
     한 번에 다 모은 뒤 두 번째 바퀴에서 값을 채운다."""
     events = []
-    short = long = 0
+    short = long = contaminated = 0
     for (routeid, nodeord), passes in sorted(stops.items()):
         passes.sort(key=lambda p: p["ts"])
+        gaps = missed.get((routeid, nodeord), [])
         for prev, cur in zip(passes, passes[1:]):
             gap = (cur["ts"] - prev["ts"]).total_seconds()
             if gap < MIN_HEADWAY_SEC:
@@ -159,13 +213,17 @@ def collect_headways(stops):
             if gap > MAX_HEADWAY_SEC:
                 long += 1
                 continue
+            dirty = has_missed_between(gaps, prev["ts"], cur["ts"])
+            if dirty:
+                contaminated += 1
             events.append({
                 "routeid": routeid, "routeno": cur["routeno"],
                 "nodeord": nodeord, "nodeid": cur["nodeid"],
                 "nodenm": cur["nodenm"],
                 "prev_ts": prev["ts"], "pass_ts": cur["ts"], "gap": gap,
+                "missed": 1 if dirty else 0,
             })
-    return events, short, long
+    return events, short, long, contaminated
 
 
 def main():
@@ -178,15 +236,18 @@ def main():
     if not official:
         print("[주의] %s 를 못 읽어 공표 배차 비교를 건너뜁니다." % DETAIL_CSV)
 
-    events, short, long = collect_headways(load_events())
+    stops, missed = load_events()
+    events, short, long, contaminated = collect_headways(stops, missed)
     if not events:
         print("[오류] 배차 사건이 하나도 없습니다.")
         print("       같은 정류장을 두 번 이상 지난 기록이 있어야 합니다.")
         return 1
 
+    clean = [e for e in events if not e["missed"]] if EXCLUDE_MISSED else events
+
     # 노선별 실측 중앙값. 공표값을 못 믿는 노선의 번칭 기준이 된다.
     gaps_by_route = {}
-    for event in events:
+    for event in clean:
         gaps_by_route.setdefault(event["routeid"], []).append(event["gap"])
     median_by_route = {rid: percentile(sorted(g), 0.5)
                        for rid, g in gaps_by_route.items()}
@@ -225,6 +286,7 @@ def main():
                 "is_bunching": bunching if ratio is not None else "",
                 "ratio_obs": "%.3f" % ratio_obs if ratio_obs is not None else "",
                 "is_bunching_obs": bunching_obs,
+                "missed_between": event["missed"],
             })
 
             summary = by_route.setdefault(routeid, {
@@ -232,7 +294,11 @@ def main():
                 "official_min": official_min if official_min else "",
                 "official_dropped": reason,
                 "gaps": [], "bunching": 0, "bunching_obs": 0, "long_wait": 0,
+                "excluded": 0,
             })
+            if EXCLUDE_MISSED and event["missed"]:
+                summary["excluded"] += 1
+                continue
             summary["gaps"].append(gap)
             summary["bunching"] += bunching
             summary["bunching_obs"] += bunching_obs
@@ -243,6 +309,8 @@ def main():
     for summary in by_route.values():
         gaps = sorted(summary["gaps"])
         n = len(gaps)
+        if not n:
+            continue
         median = percentile(gaps, 0.5)
         q1, q3 = percentile(gaps, 0.25), percentile(gaps, 0.75)
         mean = sum(gaps) / n
@@ -253,6 +321,7 @@ def main():
             "official_min": official_min,
             "official_dropped": summary["official_dropped"],
             "n_headway": n,
+            "n_excluded": summary["excluded"],
             "median_min": round(median / 60.0, 1),
             "p90_min": round(percentile(gaps, 0.9) / 60.0, 1),
             "iqr_min": round((q3 - q1) / 60.0, 1),
@@ -266,6 +335,9 @@ def main():
                                 if official_min else ""),
         })
     rows.sort(key=lambda r: -r["bunching_rate_obs"])
+    # 표본이 얇은 노선은 CSV 에는 남기되 순위표에서는 뺀다.
+    ranked = [r for r in rows if r["n_headway"] >= MIN_SAMPLE_FOR_RANK]
+    thin = [r for r in rows if r["n_headway"] < MIN_SAMPLE_FOR_RANK]
 
     with open(BY_ROUTE_CSV, "w", encoding="utf-8-sig", newline="") as out:
         writer = csv.DictWriter(out, fieldnames=BY_ROUTE_COLUMNS,
@@ -273,13 +345,32 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    valid = [r for r in rows if r["official_min"] != ""]
-    dropped = [r for r in rows if r["official_min"] == ""]
+    valid = [r for r in ranked if r["official_min"] != ""]
+    dropped = [r for r in ranked if r["official_min"] == ""]
 
     print("배차 사건 %d건 / 노선 %d개" % (len(events), len(rows)))
     print("(%d초 미만 %d건, %d시간 초과 %d건 제외)"
           % (MIN_HEADWAY_SEC, short, MAX_HEADWAY_SEC // 3600, long))
     print()
+
+    if contaminated:
+        share = 100.0 * contaminated / len(events)
+        print("관측 실패가 낀 배차 사건 %d건 (%.1f%%)" % (contaminated, share))
+        print("  그 사이를 지났을 운행을 못 봐서 간격이 부풀려진 것들이다.")
+        if EXCLUDE_MISSED:
+            dirty_median = percentile(sorted(e["gap"] for e in events), 0.5)
+            clean_median = percentile(sorted(e["gap"] for e in clean), 0.5)
+            print("  집계에서 뺐다. 전체 중앙값 %.1f분 -> 정제 후 %.1f분"
+                  % (dirty_median / 60.0, clean_median / 60.0))
+        print()
+
+    if thin:
+        print("표본 %d건 미만이라 순위에서 뺀 노선 %d개: %s"
+              % (MIN_SAMPLE_FOR_RANK, len(thin),
+                 ", ".join("%s(%d건)" % (r["routeno"], r["n_headway"])
+                           for r in thin[:8])))
+        print("  (CSV 에는 남아 있다)")
+        print()
 
     if dropped:
         print("공표 배차를 못 믿어 비운 노선 %d개 — 배차간격이 아닌 값이 들어 있다"
@@ -306,7 +397,7 @@ def main():
 
     print("실측 중앙값 대비 번칭이 잦은 노선 10개 (공표값과 무관)")
     print("  %-6s %8s %8s %8s %7s" % ("노선", "실측중앙", "P90", "번칭률", "표본"))
-    for r in rows[:10]:
+    for r in ranked[:10]:
         print("  %-6s %7.1f분 %7.1f분 %7.1f%% %7d"
               % (r["routeno"], r["median_min"], r["p90_min"],
                  r["bunching_rate_obs"], r["n_headway"]))
