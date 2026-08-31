@@ -64,6 +64,22 @@ def read_csv(path):
         return list(csv.DictReader(f))
 
 
+def by_route(rows, key="routeno"):
+    """같은 노선번호를 한 줄로 합친다.
+
+    상·하행이 별도 routeid 라 headway_by_route.csv 에는 같은 번호가 두 줄
+    나온다. 그대로 그리면 910번이 63분과 62분으로 두 번 서서 표가 지저분해
+    지고 순위도 밀린다. 표본이 큰 쪽을 그 노선의 대표로 둔다.
+    """
+    best = {}
+    for row in rows:
+        name = str(row.get(key, "")).strip()
+        n = num(row.get("n_headway"), 0) or 0
+        if name not in best or n > best[name][0]:
+            best[name] = (n, row)
+    return [row for _, row in best.values()]
+
+
 def num(text, default=None):
     try:
         return float(str(text).strip())
@@ -137,7 +153,7 @@ def legend(parts, x, y, items):
 
 def fig_headway_gap(rows, path):
     """공표와 실측을 나란히 놓는다. 계열이 둘이라 범례와 직접 라벨을 함께 단다."""
-    data = [r for r in rows
+    data = [r for r in by_route(rows)
             if num(r.get("official_min")) and num(r.get("median_min"))
             and num(r.get("gap_vs_official"), 0) > 0]
     data.sort(key=lambda r: -num(r["gap_vs_official"], 0))
@@ -191,7 +207,7 @@ def fig_p90(rows, path):
     평균이 그럭저럭인데 가끔 크게 터지는 것이 이 자료의 핵심이라, 두 값을
     따로 세우는 것보다 사이를 이어 보이는 편이 낫다.
     """
-    data = [r for r in rows
+    data = [r for r in by_route(rows)
             if num(r.get("median_min")) and num(r.get("p90_min"))
             and num(r.get("n_headway"), 0) >= 100]
     data.sort(key=lambda r: -num(r["p90_min"], 0))
