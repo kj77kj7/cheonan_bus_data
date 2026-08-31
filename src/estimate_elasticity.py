@@ -69,7 +69,11 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 RIDERSHIP_DIR = os.path.join(DATA_DIR, "ridership")
-CHANGES_CSV = os.path.join(DATA_DIR, "changes.csv")
+# 이름을 changes 로 쓰기도 change 로 쓰기도 한다. 둘 다 받는다.
+CHANGES_CANDIDATES = [os.path.join(DATA_DIR, "changes.csv"),
+                      os.path.join(DATA_DIR, "change.csv")]
+
+
 OUT_DIR = os.path.join(DATA_DIR, "processed")
 OUT_CSV = os.path.join(OUT_DIR, "elasticity.csv")
 OUT_JSON = os.path.join(OUT_DIR, "elasticity.json")
@@ -90,6 +94,13 @@ CSV_COLUMNS = ["effective_date", "route_no", "source",
                "pre_daily", "post_daily", "d_ln_riders",
                "control_n", "control_d_ln", "did",
                "d_ln_freq", "elasticity", "note"]
+
+
+def changes_path():
+    for path in CHANGES_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return CHANGES_CANDIDATES[0]
 
 
 def norm_route(text):
@@ -138,10 +149,11 @@ def load_panel():
 
 def load_changes():
     """조정 사건 목록. 시행일별로 묶는다."""
-    if not os.path.exists(CHANGES_CSV):
+    path = changes_path()
+    if not os.path.exists(path):
         return {}
     events = {}
-    with open(CHANGES_CSV, encoding="utf-8-sig", newline="") as f:
+    with open(path, encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             raw = str(row.get("effective_date", "")).strip()
             try:
@@ -301,12 +313,58 @@ def summarize(rows):
     }
 
 
+def check_changes():
+    """이용량 수집을 기다리지 않고 changes.csv 만 먼저 검사한다.
+
+    시행일이 안 읽히거나 빈도 변화량이 비어 있으면 나중에 조용히 표본에서
+    빠진다. 그걸 수집이 다 끝난 뒤에 알면 늦으므로 여기서 미리 말한다.
+    """
+    path = changes_path()
+    if not os.path.exists(path):
+        print("[오류] %s 가 없습니다." % path)
+        return 1
+    events = load_changes()
+    if not events:
+        print("[오류] %s 에서 읽어낸 줄이 없습니다." % path)
+        print("       첫 줄이 머리글인지, effective_date 가 2025-10-01 꼴인지")
+        print("       확인하십시오.")
+        return 1
+
+    print("[%s]" % path)
+    print()
+    n_ok = n_bad = 0
+    for eff in sorted(events):
+        print(" %s  노선 %d개" % (eff, len(events[eff])))
+        for c in events[eff]:
+            d, basis = d_ln_frequency(c)
+            if d is None:
+                print("   %-6s  빈도 변화량 없음 — 효과만 나오고 탄력성은 못 냄"
+                      % c["route_no"])
+                n_bad += 1
+            else:
+                print("   %-6s  %s %+.1f%%  →  탄력성 계산 가능"
+                      % (c["route_no"], basis, (math.exp(d) - 1) * 100))
+                n_ok += 1
+    print()
+    print(" 탄력성 계산 가능 %d개 / 빈도 없음 %d개" % (n_ok, n_bad))
+    if n_ok == 0:
+        print()
+        print(" 어느 줄에도 운행횟수·배차간격이 없습니다. 이대로면 탄력성은")
+        print(" 안 나오고 '이용량이 몇 %% 달라졌다'까지만 나옵니다.")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="천안 자료로 빈도탄력성을 추정한다")
     ap.add_argument("--window", type=int, default=1,
                     help="시행일 전후로 묶을 기간 수 (기본 1개월씩)")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--check", action="store_true",
+                    help="이용량 없이 changes.csv 형식만 검사한다")
     args = ap.parse_args()
+
+    if args.check:
+        return check_changes()
 
     panel = load_panel()
     if not panel:
@@ -316,7 +374,7 @@ def main():
 
     events = load_changes()
     if not events:
-        print("[오류] %s 가 없습니다." % CHANGES_CSV)
+        print("[오류] %s 가 없습니다." % changes_path())
         print()
         print("공고 첨부의 표를 아래 형식으로 옮겨 만드십시오.")
         print("  effective_date,route_no,headway_before,headway_after,"
